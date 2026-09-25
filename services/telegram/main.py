@@ -21,6 +21,7 @@ from psycopg.rows import dict_row
 
 import commands as C
 import topics as T
+import views as V
 from fmt import LOCAL, coin, dur, esc, money, num, pct, price, signed, table, trend_icon
 from tg import TelegramAPI, TelegramError
 from tradebot_core.state import REASONS, broker_for, latest_prices, round_trips
@@ -40,37 +41,25 @@ def connect():
 
 
 # ------------------------------------------------------------------ Meldungstexte
+def _account(conn, wallet):
+    return conn.execute("SELECT id, name, start_cash, strategy, interval, created_at, params FROM accounts WHERE name=%s", (wallet,)).fetchone()
+
+
 def entry_message(conn, f) -> str:
-    a = conn.execute("SELECT id, name, start_cash, strategy, interval, created_at, params FROM accounts WHERE name=%s", (f["wallet"],)).fetchone()
-    b = broker_for(conn, a, latest_prices(conn, C.SYMBOLS))
-    eq = float(b.equity()); stake = float(f["qty"] * f["price"])
+    a = _account(conn, f["wallet"])
+    eq = float(broker_for(conn, a, latest_prices(conn, C.SYMBOLS)).equity())
     st = conn.execute("SELECT state FROM bot_state WHERE wallet=%s AND symbol=%s", (f["wallet"], f["symbol"])).fetchone()
     stop = ((st or {}).get("state") or {}).get("indicators", {}).get("stop") if st else None
-    lines = [f"🔵 <b>Kauf · {coin(f['symbol'])}</b> · {esc(f['wallet'])}",
-             f"Grund: {REASONS.get(f['reason'], f['reason'] or '–')} ({C.STRAT.get(a['strategy'], a['strategy'])}, {a['interval']})",
-             f"Menge {num(float(f['qty']), 5)} @ {price(float(f['price']))}",
-             f"Einsatz {money(stake)} USDT ({pct(stake / eq, 0, False)} des Wallets) · Gebühr {num(float(f['fee']), 2)}"]
-    if stop:
-        lines.append(f"Stop {price(stop)} ({pct(stop / float(f['price']) - 1)})")
-    return "\n".join(lines)
+    return V.entry(f["wallet"], f["symbol"], float(f["qty"]), float(f["price"]), float(f["fee"]), eq, stop, f["reason"], f["ts"])
 
 
 def exit_message(conn, f) -> str:
-    a = conn.execute("SELECT id, name, start_cash, strategy, interval, created_at, params FROM accounts WHERE name=%s", (f["wallet"],)).fetchone()
+    a = _account(conn, f["wallet"])
     fills = conn.execute("SELECT symbol, side, qty, price, fee, realized_pnl, ts, bot, reason FROM fills WHERE account_id=%s AND id <= %s ORDER BY ts, id", (a["id"], f["id"])).fetchall()
     trip = next((t for t in reversed(round_trips(fills)) if t["symbol"] == f["symbol"] and t["closed"] == f["ts"]), None)
-    b = broker_for(conn, a, latest_prices(conn, C.SYMBOLS))
-    eq, start = float(b.equity()), float(a["start_cash"])
-    pnl = float(f["realized_pnl"])
-    ratio = trip["pnl_pct"] if trip else None
-    icon = "🚀" if ratio is not None and ratio >= 0.05 else "✳️" if pnl >= 0 else "⚠️" if f["reason"] == "stop_loss" else "❌"
-    lines = [f"{icon} <b>Verkauf · {coin(f['symbol'])}</b> · {esc(f['wallet'])}",
-             f"Ergebnis <b>{signed(pnl)} USDT</b>" + (f" ({pct(ratio)})" if ratio is not None else "") + " nach Gebühren",
-             f"Grund: {REASONS.get(f['reason'], f['reason'] or '–')}"]
-    if trip:
-        lines.append(f"{price(trip['entry'])} → {price(trip['exit'])} · Dauer {dur(trip['hold_days'])}")
-    lines.append(f"Wallet jetzt {money(eq)} USDT ({pct(eq / start - 1, 2)})")
-    return "\n".join(lines)
+    eq = float(broker_for(conn, a, latest_prices(conn, C.SYMBOLS)).equity())
+    return V.exit_(f["wallet"], f["symbol"], float(f["realized_pnl"]), trip["pnl_pct"] if trip else None, trip["entry"] if trip else None,
+                   trip["exit"] if trip else float(f["price"]), trip["hold_days"] if trip else None, f["reason"], eq, float(a["start_cash"]), f["ts"])
 
 
 def event_type(e) -> str:
@@ -79,33 +68,44 @@ def event_type(e) -> str:
     return {"error": "error", "warn": "warning"}.get(e["level"], "info")
 
 
-def event_message(e) -> str:
-    icon = {"error": "❌", "warn": "⚠️"}.get(e["level"], "ℹ️")
-    return f"{icon} <b>{esc(e['source'])}</b>" + (f" · {esc(e['wallet'])}" if e["wallet"] else "") + f"\n{esc(e['message'])}"
+def event_message(e) -> str | None:
+    return V.event(e)
 
 
 def daily_report(conn) -> str:
     ctx = C.Ctx(conn)
-    rep = conn.execute("SELECT value FROM control WHERE key='master_report'").fetchone()
-    day = {w["wallet"]: w for w in (json.loads(rep["value"]).get("wallets", []) if rep else [])}
-    rows_, open_pos = [], 0
-    for a in ctx.accounts():
-        b = ctx.broker(a); eq = float(b.equity()); open_pos += len(b.positions)
-        rows_.append([a["name"], money(eq), pct(eq / float(a["start_cash"]) - 1, 1), pct((day.get(a["name"]) or {}).get("day_change"), 1)])
+    rep_ = conn.execute("SELECT value FROM control WHERE key='master_report'").fetchone()
+    day = {w["wallet"]: w for w in (json.loads(rep_["value"]).get("wallets", []) if rep_ else [])}
+    total_eq = total_start = 0.0
+    open_pos, groups = 0, []
+    for label, accts in V.grouped_wallets(ctx.accounts()):
+        parts = []
+        for a in accts:
+            b = ctx.broker(a); eq = float(b.equity()); open_pos += len(b.positions)
+            total_eq += eq; total_start += float(a["start_cash"])
+            parts.append((a, eq))
+        big = parts[0]
+        dc = (day.get(big[0]["name"]) or {}).get("day_change")
+        groups.append(f"{V.dot(big[1] / float(big[0]['start_cash']) - 1)} <b>{esc(label)}</b>  {V.pct_s(big[1] / float(big[0]['start_cash']) - 1, 2)}"
+                      + (f"  <i>heute {V.pct_s(dc, 1)}</i>" if dc else ""))
     since = int((time.time() - 86400) * 1000)
     trips = [t for t in ctx.trips() if t["closed"] >= since]
-    prices = ctx.prices()
-    now = dt.datetime.now(LOCAL)
-    lines = [f"📋 <b>Tagesbericht {now:%d.%m.%Y}</b>", "",
-             table(["Wallet", "Wert", "Gesamt", "24 h"], rows_), "",
-             f"Trades in 24 h: {len(trips)}" + (f" · Ergebnis {signed(sum(t['pnl'] for t in trips))} USDT" if trips else ""),
-             f"Offene Positionen: {open_pos}",
-             "", "<b>Je Coin</b>", C.coins_block(ctx)]
     text, _ = C.cmd_system(ctx, [], R)
-    problems = [l for l in text.split("\n") if l.startswith("🔴")]
-    lines.append("")
-    lines.append("System: " + ("alles in Ordnung" if not problems else "Störung – " + "; ".join(p[2:] for p in problems)))
-    return "\n".join(lines)
+    problems = [l[2:].split(":")[0] for l in text.split("\n") if l.startswith("🔴")]
+    now = dt.datetime.now(LOCAL)
+    wd = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"][now.weekday()]
+    return V.join(
+        f"📋 <b>Tagesbericht · {wd} {now:%d.%m.}</b>",
+        f"<b>{V.usd(total_eq)}</b> in {len(ctx.accounts())} Wallets{SEP_}{V.pct_s(total_eq / total_start - 1, 2)} seit Start",
+        V.quote([f"Trades in 24 h: {len(trips)}" + (f"{SEP_}{V.usd_signed(sum(t['pnl'] for t in trips))}" if trips else ""),
+                 f"Offene Positionen: {open_pos}",
+                 "System: ✅ alles in Ordnung" if not problems else "System: ⚠️ " + ", ".join(problems)]),
+        "", "<b>Strategien</b> <i>(Wallet mit 10.000 $)</i>", V.quote(groups),
+        "", "<b>Coins</b>", C.coins_compact(ctx),
+        V.footer("Details: /profit · /coins · /status"))
+
+
+SEP_ = " · "
 
 
 # ------------------------------------------------------------------ Bot
@@ -246,9 +246,9 @@ class Notifier:
             self.state["last_fill"] = f["id"]; self.save_state()
         events = self.conn.execute("SELECT id, ts, level, source, wallet, message FROM events WHERE id > %s ORDER BY id", (self.state["last_event"],)).fetchall()
         for e in events:
-            trade_log = e["source"] == "bots" and e["message"].startswith(("KAUF ", "VERKAUF "))  # kommt schon als Trade-Meldung
-            if e["source"] != "telegram" and not trade_log:
-                self.send(event_type(e), event_message(e), settings)
+            text = event_message(e) if e["source"] != "telegram" else None  # eigene Aktionen wurden schon beantwortet
+            if text:
+                self.send(event_type(e), text, settings)
             self.state["last_event"] = e["id"]; self.save_state()
         self.watch_services(settings)
         now = dt.datetime.now(LOCAL)
@@ -265,9 +265,9 @@ class Notifier:
             v = R.get(f"heartbeat:{svc}")
             is_down = v is None or now - float(v) > 120
             if is_down and not down.get(svc):
-                self.send("error", f"🔴 <b>Dienst {esc(svc)} meldet sich nicht</b>\nSeit mehr als 2 Minuten kein Lebenszeichen. Docker startet ihn in der Regel automatisch neu.", settings)
+                self.send("error", V.service_down(svc, int(now * 1000)), settings)
             elif not is_down and down.get(svc):
-                self.send("info", f"🟢 Dienst <b>{esc(svc)}</b> läuft wieder.", settings)
+                self.send("info", V.service_up(svc, int(now * 1000)), settings)
             if bool(down.get(svc)) != is_down:
                 down[svc] = is_down; self.save_state()
 
@@ -306,7 +306,7 @@ def main():
         topics.setup()
         log.info("Chat %s: %s", "Gruppe mit Themen" if topics.forum else "ohne Themen", topics.ids if topics.forum else "")
         threading.Thread(target=Notifier(api, topics).run_forever, daemon=True).start()
-        topics.send("startup", "🤖 <b>Tradebot verbunden.</b> Befehle: /help" + ("\nMeldungen laufen in die Themen dieser Gruppe (/topics)." if topics.forum else ""),
+        topics.send("startup", V.join("🤖 <b>Tradebot verbunden</b>", V.quote(["Befehle: /help", "Themen und Zuordnung: /topics" if topics.forum else ""])),
                     silent=C.notify_settings(connect()).get("startup") == "silent", markup=C.KEYBOARD)
     if not AUTHORIZED and CHAT_ID.startswith("-"):
         log.warning("Gruppe ohne TELEGRAM_AUTHORIZED: jedes Gruppenmitglied könnte steuern.")

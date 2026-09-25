@@ -9,6 +9,8 @@ import time
 from collections import defaultdict
 
 from fmt import coin, dur, esc, money, num, pct, price, signed, table, trend_icon, ts
+import views as V
+from views import SEP, bar, dot, footer, join, pct_s, quote, usd, usd_signed
 from tradebot_core.docs import PARAMS
 from tradebot_core.metrics import max_drawdown, trade_stats
 from tradebot_core.models import Side
@@ -136,71 +138,85 @@ def cmd_status(ctx, args):
     blocks = []
     for a in accts:
         b = ctx.broker(a)
-        if not b.positions:
-            continue
         st = ctx.states(a["name"])
-        opened = {}
-        for f in b.fills:
-            if f.side == Side.BUY:
-                opened[f.symbol] = f.ts
+        opened = {f.symbol: f.ts for f in b.fills if f.side == Side.BUY}
         for sym, p in b.positions.items():
-            px = float(b.prices[sym]); cost = float(p.cost); val = float(p.qty) * px
-            ind = (st.get(sym) or {}).get("indicators", {})
-            stop = ind.get("stop")
-            lines = [f"<b>{esc(a['name'])}</b> · {coin(sym)}",
-                     f"{num(float(p.qty), 5)} @ {price(float(p.avg_cost))} → {price(px)}",
-                     f"{trend_icon(val - cost)} {signed(val - cost)} USDT ({pct(val / cost - 1)}) · seit {dur((now_ms() - opened.get(sym, now_ms())) / 864e5)}"]
-            if stop:
-                lines.append(f"Stop {price(stop)} ({pct(stop / px - 1)})")
-            blocks.append("\n".join(lines))
+            px, cost = float(b.prices[sym]), float(p.cost)
+            val = float(p.qty) * px
+            stop = ((st.get(sym) or {}).get("indicators") or {}).get("stop")
+            blocks.append(join(
+                f"{dot(val - cost)} <b>{coin(sym)}</b>  <b>{pct_s(val / cost - 1)}</b>{SEP}{usd_signed(val - cost)}",
+                quote([f"{usd(float(p.avg_cost))} → {usd(px)}{SEP}seit {dur((now_ms() - opened.get(sym, now_ms())) / 864e5)}",
+                       f"Stop {usd(stop)}{SEP}{pct_s(stop / px - 1)} entfernt" if stop else "",
+                       f"Wert {usd(val)}"]),
+                footer(V.strategy_label(a["name"]), a["name"])))
+    scope = esc(accts[0]["name"]) if args else "alle Wallets"
     if not blocks:
-        return ("📭 Keine offenen Positionen." + (f" {esc(accts[0]['name'])} wartet auf ein Signal." if args else " Alle Wallets warten auf Signale.")
-                + "\nWie nah die Signale sind: /signals"), refresh("/status " + " ".join(args))
-    return f"📊 <b>Offene Positionen ({len(blocks)})</b>\n\n" + "\n\n".join(blocks), refresh("/status " + " ".join(args))
+        return join("📭 <b>Keine offenen Positionen</b>", quote([f"{scope} warten auf ein Kaufsignal.", "Wie nah die Signale sind: /coins"])), refresh("/status " + " ".join(args))
+    return join(f"📊 <b>Offene Positionen · {len(blocks)}</b>", "", "\n\n".join(blocks)), refresh("/status " + " ".join(args))
 
 
 def cmd_wallets(ctx, args):
-    rows_, ctrl = [], ctx.control()
-    for a in ctx.accounts():
-        b = ctx.broker(a); eq = float(b.equity()); start = float(a["start_cash"])
-        flag = "⏸" if f"pause:{a['name']}" in ctrl or "kill" in ctrl else ""
-        rows_.append([a["name"] + flag, money(eq), pct(eq / start - 1, 2)])
-    return "💼 <b>Wallets</b> (virtuelles Geld)\n" + table(["Wallet", "Wert", "Rendite"], rows_) + "\n⏸ = pausiert", refresh("/wallets")
+    ctrl = ctx.control()
+    lines, total, total_start = [], 0.0, 0.0
+    for label, accts in V.grouped_wallets(ctx.accounts()):
+        parts = []
+        for a in accts:
+            eq = float(ctx.broker(a).equity()); start = float(a["start_cash"])
+            total += eq; total_start += start
+            parts.append((a, eq, start, f"pause:{a['name']}" in ctrl or "kill" in ctrl))
+        a, eq, start, paused = parts[0]
+        small = [f"Kleinkonto {usd(x[1])}" + (" ⏸️" if x[3] else "") for x in parts[1:]]
+        lines.append(f"{dot(eq / start - 1)} <b>{esc(label)}</b>  <b>{pct_s(eq / start - 1, 2)}</b>{' ⏸️' if paused else ''}\n"
+                     f"      {usd(eq)}" + (SEP + SEP.join(small) if small else ""))
+    return join("💼 <b>Wallets</b>", f"<b>{usd(total)}</b> gesamt{SEP}{pct_s(total / total_start - 1, 2)}", "", "\n".join(lines), "",
+                footer("Rendite der 10.000er-Wallet · ⏸️ = pausiert")), refresh("/wallets")
 
 
 def cmd_count(ctx, args):
-    rows_ = []
-    for a in ctx.accounts():
-        b = ctx.broker(a)
-        rows_.append([a["name"], f"{len(b.positions)}/{len(SYMBOLS)}", ", ".join(coin(s) for s in b.positions) or "–"])
-    return "🔢 <b>Belegte Plätze</b> (max. 1 Position je Coin)\n" + table(["Wallet", "Plätze", "Coins"], rows_, "lrl"), refresh("/count")
+    lines = []
+    for label, accts in V.grouped_wallets(ctx.accounts()):
+        b = ctx.broker(accts[0])
+        held = ", ".join(coin(s) for s in b.positions) or "keine"
+        lines.append(f"<b>{esc(label)}</b>  {bar(len(b.positions) / len(SYMBOLS), len(SYMBOLS))}  {len(b.positions)}/{len(SYMBOLS)}{SEP}{held}")
+    return join("🔢 <b>Belegte Plätze</b>", quote(["Je Wallet höchstens eine Position je Coin."]), "\n".join(lines),
+                footer("Stand der 10.000er-Wallets; die 100er handeln dieselben Signale")), refresh("/count")
+
+
+def signal_frac(strategy, s):
+    """Nähe zum Kaufsignal: 0 = weit weg, 1 = Signal erreicht."""
+    ind, c = s.get("indicators", {}), s.get("close")
+    if strategy == "trend" and ind.get("entry_level") and c:
+        return max(0.0, 1 - (ind["entry_level"] / c - 1) / 0.10)
+    if strategy == "meanrev" and ind.get("rsi") is not None:
+        return max(0.0, min(1.0, (70 - ind["rsi"]) / 40))
+    return None
+
+
+def signal_short(strategy, s):
+    ind, c = s.get("indicators", {}), s.get("close")
+    if s.get("in_position"):
+        return "offen" + (f", Stop {pct_s(ind['stop'] / c - 1, 1)}" if ind.get("stop") and c else "")
+    if strategy == "trend" and ind.get("entry_level") and c:
+        return "+" + num((ind["entry_level"] / c - 1) * 100, 1) + " %"
+    if strategy == "meanrev" and ind.get("rsi") is not None:
+        return f"RSI {num(ind['rsi'], 0)} → 30"
+    return "–"
 
 
 def signal_text(strategy, s):
     ind, c = s.get("indicators", {}), s.get("close")
     if s.get("in_position"):
-        return "Position" + (f", Stop {pct(ind['stop'] / c - 1, 1)}" if ind.get("stop") and c else "")
+        return "Position offen" + (f", Stop {pct_s(ind['stop'] / c - 1, 1)}" if ind.get("stop") and c else "")
     if strategy == "trend" and ind.get("entry_level") and c:
-        return pct(ind["entry_level"] / c - 1, 1)
+        return f"noch {pct(ind['entry_level'] / c - 1, 1, False)} bis Ausbruch"
     if strategy == "meanrev" and ind.get("rsi") is not None:
-        return "RSI " + num(ind["rsi"], 0)
+        return f"RSI {num(ind['rsi'], 0)} (Kauf unter 30)"
     return "–"
 
 
 def cmd_signals(ctx, args):
-    lines = ["🎯 <b>Abstand zum nächsten Signal</b>", "Trend: fehlender Anstieg bis zum Ausbruch · Mean Reversion: RSI (Kauf unter 30)", ""]
-    groups = {}  # Wallets mit gleicher Strategie und gleichen Parametern haben dieselben Signale
-    for a in ctx.accounts():
-        st = ctx.states(a["name"])
-        parts = " · ".join(f"{coin(sym)} {signal_text(a['strategy'], st[sym])}" for sym in SYMBOLS if sym in st)
-        key = (a["strategy"], a["interval"], json.dumps((a["params"] or {}).get("strategy_params"), sort_keys=True), parts)
-        groups.setdefault(key, []).append(a["name"])
-    for (strategy, interval, _, parts), names in groups.items():
-        lines.append(f"<b>{' / '.join(esc(n) for n in names)}</b>\n  {parts or 'noch kein Zustand'}")
-    return "\n".join(lines), refresh("/signals")
-
-
-GROUP_LABEL = {("trend", "4h", ""): "Trend 4h", ("trend", "4h", "4hL"): "Trend 4h lang", ("trend", "1d", "1d"): "Trend 1d", ("meanrev", "4h", ""): "Mean Rev."}
+    return cmd_coins(ctx, args)
 
 
 def strategy_groups(ctx):
@@ -210,31 +226,50 @@ def strategy_groups(ctx):
         key = (a["strategy"], a["interval"], json.dumps((a["params"] or {}).get("strategy_params"), sort_keys=True))
         if key not in groups or float(a["start_cash"]) > float(groups[key]["start_cash"]):
             groups[key] = a
-    out = []
-    for a in groups.values():
-        suffix = a["name"].split("-")[0][len(a["strategy"]):]
-        out.append((GROUP_LABEL.get((a["strategy"], a["interval"], suffix), f"{a['strategy']} {a['interval']}"), a))
-    return sorted(out, key=lambda x: x[0])
+    order = lambda a: V.STRATEGY_ORDER.index(V.wallet_parts(a["name"])[0]) if V.wallet_parts(a["name"])[0] in V.STRATEGY_ORDER else 99
+    return [(V.strategy_label(a["name"]), a) for a in sorted(groups.values(), key=order)]
 
 
 def coins_block(ctx) -> str:
-    prices, lines = ctx.prices(), []
-    held = defaultdict(list)
+    prices, blocks = ctx.prices(), []
+    held = defaultdict(int)
     for a in ctx.accounts():
-        for sym in ctx.broker(a).positions:
-            held[sym].append(a["name"])
+        if float(a["start_cash"]) >= 1000:
+            for sym in ctx.broker(a).positions:
+                held[sym] += 1
     groups = strategy_groups(ctx)
     for sym in SYMBOLS:
         p = prices.get(sym, {})
-        h = held.get(sym, [])
-        sig = " · ".join(f"{label} {signal_text(a['strategy'], ctx.states(a['name']).get(sym, {}))}" for label, a in groups)
-        lines.append(f"<b>{coin(sym)}</b> {price(p.get('price'))} ({pct(p.get('change_24h'), 1)})\n"
-                     f"  {'gehalten in ' + str(len(h)) + ' Wallet' + ('s' if len(h) != 1 else '') if h else 'nicht gehalten'}\n  {sig}")
+        rows_ = []
+        for label, a in groups:
+            st = ctx.states(a["name"]).get(sym, {})
+            f = signal_frac(a["strategy"], st)
+            rows_.append(f"{bar(f) if f is not None and not st.get('in_position') else '●●●●●' if st.get('in_position') else '▱▱▱▱▱'}  <b>{esc(V.strategy_short(a['name']))}</b>  {signal_short(a['strategy'], st)}")
+        h = held.get(sym, 0)
+        blocks.append(join(f"{dot(p.get('change_24h'))} <b>{coin(sym)}</b>  {usd(p.get('price'))}  <i>{pct_s(p.get('change_24h'), 1)}</i>"
+                           + (f"{SEP}{h}× gehalten" if h else ""), quote(rows_)))
+    return "\n\n".join(blocks)
+
+
+def coins_compact(ctx) -> str:
+    """Kurzform für den Tagesbericht: eine Zeile je Coin."""
+    prices, groups, lines = ctx.prices(), strategy_groups(ctx), []
+    for sym in SYMBOLS:
+        p = prices.get(sym, {})
+        best = None
+        for label, a in groups:
+            st = ctx.states(a["name"]).get(sym, {})
+            f = signal_frac(a["strategy"], st)
+            if f is not None and not st.get("in_position") and (best is None or f > best[0]):
+                best = (f, label)
+        held = sum(1 for a in ctx.accounts() if float(a["start_cash"]) >= 1000 and sym in ctx.broker(a).positions)
+        lines.append(f"{dot(p.get('change_24h'))} <b>{coin(sym)}</b> {usd(p.get('price'))} <i>{pct_s(p.get('change_24h'), 1)}</i>"
+                     + (f"{SEP}{held}× gehalten" if held else "") + (f"\n      {bar(best[0])} nächstes Signal: {esc(best[1])}" if best else ""))
     return "\n".join(lines)
 
 
 def cmd_coins(ctx, args):
-    return ("🪙 <b>Je Coin</b>\nKurs (24 h) · gehalten · Abstand zum Kaufsignal je Strategie\n\n" + coins_block(ctx)), refresh("/coins")
+    return join("🪙 <b>Coins</b>", coins_block(ctx), "", footer("Balken = Nähe zum Kaufsignal · Prozent = nötiger Anstieg bis zum Ausbruch · RSI → 30 = Kaufschwelle · ●●●●● = Position offen")), refresh("/coins")
 
 
 def cmd_topics(ctx, args):
@@ -287,24 +322,26 @@ def cmd_profit(ctx, args):
         b, start, eq, snaps, trips, s = wallet_stats(ctx, a)
         unreal = eq - float(b.cash) - sum(float(p.cost) for p in b.positions.values())
         pf = s["profit_factor"]
-        lines = [f"💰 <b>{esc(a['name'])}</b> · {STRAT.get(a['strategy'], a['strategy'])} · {a['interval']}",
-                 f"Wert {money(eq)} USDT ({pct(eq / start - 1, 2)})",
-                 f"Realisiert {signed(float(b.realized_pnl))} · unrealisiert {signed(unreal)}",
-                 f"Gebühren {money(float(b.fees_paid))}",
-                 "",
-                 f"Trades {s['trades']} · Treffer {pct(s['win_rate'], 0, False)}",
-                 f"Profit-Faktor {'∞' if pf == float('inf') else num(pf)} · Erwartung {signed(s['expectancy'])} je Trade",
-                 f"Ø Gewinn {signed(s['avg_win'])} · Ø Verlust {signed(s['avg_loss'])}",
-                 f"Bester {signed(s['best'])} · schlechtester {signed(s['worst'])}",
-                 f"Ø Haltedauer {dur(sum(t['hold_days'] for t in trips) / len(trips)) if trips else '–'}",
-                 f"Max. Drawdown {pct(-dd) if (dd := max_drawdown(start, snaps + [eq])) else '0,0 %'}",
-                 f"Seit {ts(int(a['created_at'].timestamp() * 1000))}"]
-        return "\n".join(lines), refresh("/profit " + a["name"])
-    rows_ = []
-    for a in ctx.accounts():
-        b, start, eq, snaps, trips, s = wallet_stats(ctx, a)
-        rows_.append([a["name"], pct(eq / start - 1, 2), str(s["trades"]), pct(s["win_rate"], 0, False) if s["win_rate"] is not None else "–"])
-    return "💰 <b>Ergebnis je Wallet</b>\n" + table(["Wallet", "Rendite", "Tr.", "Treffer"], rows_) + "\nDetails: /profit &lt;wallet&gt;", refresh("/profit")
+        dd = max_drawdown(start, snaps + [eq])
+        return join(
+            f"💰 <b>{esc(V.strategy_label(a['name']))}</b> · {esc(V.size_label(a['name']))}",
+            f"<b>{usd(eq)}</b>{SEP}<b>{pct_s(eq / start - 1, 2)}</b> seit Start",
+            quote([f"Realisiert {usd_signed(float(b.realized_pnl))}{SEP}offen {usd_signed(unreal)}",
+                   f"Gebühren {usd(float(b.fees_paid))}{SEP}max. Drawdown {pct_s(-dd) if dd else '0 %'}"]),
+            "<b>Trades</b>",
+            quote([f"{s['trades']} abgeschlossen{SEP}Trefferquote {pct(s['win_rate'], 0, False)}" if s["trades"] else "Noch keine abgeschlossenen Trades",
+                   f"Profit-Faktor {'∞' if pf == float('inf') else num(pf)}{SEP}Erwartung {usd_signed(s['expectancy'])} je Trade" if s["trades"] else "",
+                   f"Ø Gewinn {usd_signed(s['avg_win'])}{SEP}Ø Verlust {usd_signed(s['avg_loss'])}" if s["trades"] else "",
+                   f"Bester {usd_signed(s['best'])}{SEP}schlechtester {usd_signed(s['worst'])}" if s["trades"] else "",
+                   f"Ø Haltedauer {dur(sum(t['hold_days'] for t in trips) / len(trips))}" if trips else ""]),
+            footer(a["name"], f"seit {ts(int(a['created_at'].timestamp() * 1000))}")), refresh("/profit " + a["name"])
+    lines = []
+    for label, accts in V.grouped_wallets(ctx.accounts()):
+        b, start, eq, snaps, trips, s = wallet_stats(ctx, accts[0])
+        r = eq / start - 1
+        lines.append(f"{dot(r)} <b>{esc(label)}</b>  <b>{pct_s(r, 2)}</b>\n      {V.plural(s['trades'], 'Trade', 'Trades')}"
+                     + (f"{SEP}{pct(s['win_rate'], 0, False)} Treffer{SEP}{usd_signed(float(b.realized_pnl))}" if s["trades"] else ""))
+    return join("💰 <b>Ergebnis je Strategie</b>", "\n".join(lines), "", footer("10.000er-Wallets · Details: /profit trend4hL-10000")), refresh("/profit")
 
 
 def period_key(ms, unit):
@@ -359,7 +396,7 @@ def cmd_period(ctx, args, unit):
     title = {"day": "Täglich", "week": "Wöchentlich", "month": "Monatlich"}[unit]
     scope = esc(wallet["name"]) if wallet else "alle Wallets"
     return (f"📅 <b>{title}</b> · {scope}\n" + table(["Zeitraum", "Tr.", "Realisiert", "Wert"], rows_)
-            + "\nRealisiert = Summe abgeschlossener Trades (USDT) · Wert = Veränderung des Gesamtwerts"), refresh(f"/{PERIOD_CMD[unit]} " + " ".join(args))
+            + "\n" + footer("Realisiert = abgeschlossene Trades in $ · Wert = Veränderung des Gesamtwerts")), refresh(f"/{PERIOD_CMD[unit]} " + " ".join(args))
 
 
 def cmd_performance(ctx, args):
@@ -399,41 +436,41 @@ def cmd_trades(ctx, args):
             a = ctx.resolve(x)
             if not a:
                 return unknown_wallet(ctx, x)
-    trips = ctx.trips(a)[-n:][::-1]
+    trips = [t for t in ctx.trips(a) if a or V.wallet_parts(t["wallet"])[1] >= 1000][-n:][::-1]  # ohne Angabe: nur große Wallets
     if not trips:
-        return "🧾 Noch keine abgeschlossenen Trades.", None
-    lines = [f"🧾 <b>Letzte {len(trips)} Trades</b> · {esc(a['name']) if a else 'alle Wallets'}", ""]
-    for t in trips:
-        lines.append(f"{trend_icon(t['pnl'])} <b>{coin(t['symbol'])}</b> {esc(t['wallet'])}\n   {signed(t['pnl'])} USDT ({pct(t['pnl_pct'])}) · {REASONS.get(t['exit_reason'], t['exit_reason'])} · {dur(t['hold_days'])} · {ts(t['closed'])}")
-    return "\n".join(lines), refresh("/trades " + " ".join(args))
+        return join("🧾 <b>Noch keine abgeschlossenen Trades</b>", quote(["Offene Positionen: /status"])), None
+    blocks = [join(f"{dot(t['pnl'])} <b>{coin(t['symbol'])}</b>  <b>{pct_s(t['pnl_pct'])}</b>{SEP}{usd_signed(t['pnl'])}",
+                   f"      <i>{esc(V.strategy_short(t['wallet']))}{SEP}{esc(V.REASON_SHORT.get(t['exit_reason'], t['exit_reason']))}{SEP}{dur(t['hold_days'])}{SEP}{ts(t['closed'])[:6]}</i>") for t in trips]
+    return join(f"🧾 <b>Letzte {V.plural(len(trips), 'Trade', 'Trades')}</b>", "\n".join(blocks), "", footer(a["name"] if a else "10.000er-Wallets")), refresh("/trades " + " ".join(args))
 
 
 # ------------------------------------------------------------------ System
 def cmd_system(ctx, args, redis=None):
     now = time.time()
-    lines = ["🖥 <b>System</b>"]
+    rows_ = []
+    names = {"market-data": "Kursdaten-Dienst", "bots": "Bot-Service", "master": "Master-Bot", "telegram": "Telegram-Bot"}
     if redis is not None:
         for svc in ("market-data", "bots", "master", "telegram"):
             v = redis.get(f"heartbeat:{svc}")
             age = now - float(v) if v else None
-            lines.append(f"{'🟢' if age is not None and age < 60 else '🔴'} {svc}: {'kein Signal' if age is None else f'vor {int(age)} s'}")
+            rows_.append(f"{'🟢' if age is not None and age < 60 else '🔴'} {names[svc]}: {'kein Signal' if age is None else 'aktiv'}")
     last = ctx.conn.execute("SELECT max(close_time) AS t FROM candles WHERE interval='15m'").fetchone()["t"]
     age = now - last / 1000 if last else None
-    lines.append(f"{'🟢' if age is not None and age < 1500 else '🔴'} Kursdaten: letzte 15-min-Kerze vor {int(age / 60) if age else '?'} min")
+    rows_.append(f"{'🟢' if age is not None and age < 1500 else '🔴'} Kursdaten: vor {int(age / 60) if age else '?'} min")
     ctrl = ctx.control()
-    lines.append("")
-    lines.append("🛑 <b>Kill-Switch AKTIV</b>" if "kill" in ctrl else "Kill-Switch: aus")
     paused = [k.split(":", 1)[1] for k in ctrl if k.startswith("pause:")]
-    lines.append("Pausiert: " + (", ".join(esc(p) for p in paused) if paused else "keine"))
-    return "\n".join(lines), refresh("/system")
+    ok = all(r.startswith("🟢") for r in rows_)
+    return join(f"{'✅' if ok else '⚠️'} <b>System {'läuft' if ok else 'mit Störung'}</b>", quote(rows_),
+                "🛑 <b>Kill-Switch AKTIV</b> · aufheben mit /unkill" if "kill" in ctrl else "",
+                ("⏸️ Pausiert: " + ", ".join(esc(p) for p in paused)) if paused else "⏸️ Keine Wallet pausiert"), refresh("/system")
 
 
 def cmd_events(ctx, args):
     n = max(1, min(int(args[0]), 40)) if args and args[0].isdigit() else 10
     ev = ctx.conn.execute("SELECT ts, level, source, wallet, message FROM events ORDER BY id DESC LIMIT %s", (n,)).fetchall()
-    icon = {"info": "ℹ️", "warn": "⚠️", "error": "❌"}
-    lines = [f"📜 <b>Letzte {len(ev)} Ereignisse</b>", ""] + [f"{icon.get(e['level'], '•')} {ts(e['ts'])} {esc(e['source'])}{' · ' + esc(e['wallet']) if e['wallet'] else ''}\n   {esc(e['message'])}" for e in ev]
-    return "\n".join(lines), refresh("/events " + " ".join(args))
+    icon = {"info": "▫️", "warn": "⚠️", "error": "❌"}
+    lines = [f"{icon.get(e['level'], '▫️')} <b>{ts(e['ts'])}</b>{SEP}{esc(e['wallet'] or e['source'])}\n      <i>{esc(e['message'][:140])}</i>" for e in ev]
+    return join(f"📜 <b>Letzte {len(ev)} Ereignisse</b>", "\n".join(lines)), refresh("/events " + " ".join(args))
 
 
 def cmd_config(ctx, args):
@@ -475,7 +512,7 @@ def do_pause(ctx, target, pause: bool, who="Telegram"):
         add_event(ctx.conn, "telegram", "warn" if pause else "info", ("Manuell pausiert (keine neuen Einstiege)" if pause else "Manuell freigegeben") + f" über {who}", n)
     ctx.conn.commit()
     what = "alle Wallets" if len(names) > 1 else names[0]
-    return (f"⏸ <b>{esc(what)} pausiert.</b> Keine neuen Einstiege; offene Positionen werden weiter von der Strategie verwaltet." if pause
+    return (f"⏸️ <b>{esc(what)} pausiert.</b> Keine neuen Einstiege; offene Positionen werden weiter von der Strategie verwaltet." if pause
             else f"▶️ <b>{esc(what)} freigegeben.</b> Neue Einstiege sind wieder erlaubt." + (" Achtung: Der Kill-Switch ist noch aktiv (/unkill)." if "kill" in ctx.control() else ""))
 
 

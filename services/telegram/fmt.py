@@ -68,7 +68,7 @@ def table(headers: list[str], rows: list[list], align: str | None = None) -> str
     cells = [[str(c) for c in r] for r in rows]
     w = [max([len(headers[i])] + [len(r[i]) for r in cells]) for i in range(len(headers))]
     fmt_row = lambda r: " ".join(c.ljust(w[i]) if align[i] == "l" else c.rjust(w[i]) for i, c in enumerate(r)).rstrip()
-    lines = [fmt_row(headers), " ".join("─" * x for x in w)] + [fmt_row(r) for r in cells]
+    lines = [fmt_row(headers)] + [fmt_row(r) for r in cells]
     return "<pre>" + esc("\n".join(lines)) + "</pre>"
 
 

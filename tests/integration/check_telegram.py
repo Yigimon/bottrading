@@ -14,8 +14,9 @@ import commands as C  # noqa: E402
 import main as M  # noqa: E402
 
 CHAT = int(os.environ["TELEGRAM_CHAT_ID"])
+M.AUTHORIZED = {"1"}  # Test-Nutzer; die echte Freigabeliste bleibt unberührt
 RESULTS = []
-ALLOWED_TAGS = {"b", "i", "code", "pre", "a"}
+ALLOWED_TAGS = {"b", "i", "u", "s", "code", "pre", "a", "blockquote"}
 
 
 def check(name, ok, detail=""):
@@ -109,8 +110,8 @@ def main():
         texts = [s["text"] for s in api.sent]
         if os.environ.get("SHOW"):
             print("\n\n".join(texts[:3]), "\n")
-        check("Kaufmeldung", any("Kauf · BTC" in t and "Ausbruch" in t and "Stop" in t for t in texts))
-        check("Verkaufsmeldung mit Ergebnis, Grund und Dauer", any("Verkauf · BTC" in t and "+153,44" in t and "Stop-Loss" in t and "Dauer 2 T" in t for t in texts))
+        check("Kaufmeldung", any("Kauf · BTC" in t and "Ausbruch" in t and "Stop 79.000" in t for t in texts))
+        check("Verkaufsmeldung mit Ergebnis, Grund und Dauer", any("Verkauf · BTC" in t and "+153,44 $" in t and "Stop erreicht" in t and "2 T 0 h" in t for t in texts))
         check("Warn-Ereignis weitergeleitet", any("Auto-Pause: Test" in t for t in texts))
         check("Trade-Protokoll nicht doppelt gemeldet", not any("KAUF 0.03" in t for t in texts))
         check("Alle Meldungen gültiges Telegram-HTML", all(html_ok(t) for t in texts))
@@ -141,8 +142,8 @@ def main():
         n2.tick()
         by = {s["text"].split("\n")[0]: s for s in fapi.sent}
         th = topics.ids
-        big = next((s for s in fapi.sent if s["text"].split("\n")[0].endswith("· itest-tg")), None)
-        smallmsg = next((s for s in fapi.sent if "itest-tg-100" in s["text"]), None)
+        buys = [s for s in fapi.sent if "Kauf · BTC" in s["text"]]  # Reihenfolge der Fills: erst große, dann kleine Wallet
+        big, smallmsg = (buys + [None, None])[:2]
         alarm = next((s for s in fapi.sent if "meldet sich nicht" in s["text"]), None)
         start = next((s for s in fapi.sent if "gestartet" in s["text"]), None)
         check("Trades der 10.000er-Wallet → Thema Trades 10.000", big and big["thread"] == th["trades_big"] and not big["silent"])
@@ -176,7 +177,7 @@ def main():
             for c in ("/status itest-tg", "/wallets", "/daily 3", "/signals", "/profit itest-tg"):
                 print(bot.run_command(c)[0], "\n")
         t, _ = bot.run_command("/profit itest-tg")
-        check("/profit zeigt richtige Kennzahlen", "Trades 2" in t and "Treffer 100 %" in t, t.split("\n")[5] if len(t.split("\n")) > 5 else t)
+        check("/profit zeigt richtige Kennzahlen", "2 abgeschlossen" in t and "Trefferquote 100 %" in t, t)
         t, _ = bot.run_command("/status itest-tg")
         check("/status zeigt offene Position mit Stop", "itest-tg" in t and "Stop 79.000" in t)
         t, _ = bot.run_command("/stats itest-tg")
@@ -208,6 +209,12 @@ def main():
         bot.on_message({"chat": {"id": 999}, "from": {"id": 999}, "text": "/kill"})
         bot.on_callback({"id": "2", "data": "ky", "from": {"id": 999}, "message": {"message_id": 1, "chat": {"id": 999}}})
         conn.commit()
+        before_edits = len(fake.edits)
+        bot.on_message({"chat": {"id": CHAT}, "from": {"id": 555}, "text": "/pause all"})
+        bot.on_callback({"id": "3", "data": "ky", "from": {"id": 555}, "message": {"message_id": 1, "chat": {"id": CHAT}}})
+        conn.commit()
+        check("Anderes Gruppenmitglied kann nicht steuern", len(fake.edits) == before_edits and conn.execute("SELECT 1 FROM control WHERE key='kill'").fetchone() is None
+              and conn.execute("SELECT 1 FROM control WHERE key LIKE 'pause:%%' AND reason LIKE '%%Telegram%%'").fetchone() is None)
         check("Fremde Chats werden ignoriert (auch Knöpfe)", len(fake.sent) == before and conn.execute("SELECT 1 FROM control WHERE key='kill'").fetchone() is None)
 
         # ---- Bot-Service führt den manuellen Verkauf aus: wartet auf die Verarbeitung (Wallet ist dem Dienst unbekannt -> Hinweis)
