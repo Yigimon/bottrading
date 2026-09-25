@@ -168,6 +168,25 @@ def test_master_autopause(conn):
     check("Master pausiert Wallet bei Drawdown über der Grenze", bool(paused), paused[0] if paused else "keine Pause nach 90 s")
 
 
+def test_force_exit(conn):
+    """Manueller Ausstieg (Telegram /forceexit) schließt genau die gewählte Position mit Grund 'force_exit'."""
+    aid = make_wallet(conn, "itest-fx", "trend", "4h", {}, int(time.time() * 1000))
+    w = wallet_obj(aid, "itest-fx", "trend", "4h", {})
+    for sym in ("BTCUSDT", "ETHUSDT"):
+        w.broker.set_price(sym, D("100") if sym == "ETHUSDT" else D("80000"))
+        w.broker.place_order(sym, Side.BUY, w.broker.affordable_qty(sym, 1000), bot="t", reason="breakout")
+    from psycopg.rows import dict_row
+    dconn = psycopg.connect(DB, row_factory=dict_row)
+    ok = bots.close_position(dconn, w, "BTCUSDT", "force_exit")
+    bots.persist(dconn, w, int(time.time() * 1000)); dconn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT symbol, side, reason FROM fills WHERE account_id=%s ORDER BY id", (aid,))
+        rows = cur.fetchall()
+    check("Manueller Ausstieg schließt nur die gewählte Position", ok and w.broker.position_qty("BTCUSDT") == 0 and w.broker.position_qty("ETHUSDT") > 0)
+    check("Manueller Ausstieg wird mit Grund gespeichert", ("BTCUSDT", "sell", "force_exit") in rows and ("ETHUSDT", "buy", "breakout") in rows, str(rows))
+    dconn.close()
+
+
 def main():
     conn = psycopg.connect(DB)
     cleanup(conn)
@@ -176,6 +195,7 @@ def main():
         test_live_vs_backtest(conn)
         test_restart_replay(conn)
         test_master_autopause(conn)
+        test_force_exit(conn)
     finally:
         cleanup(conn)
     failed = [r for r in RESULTS if not r[1]]

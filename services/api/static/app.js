@@ -615,12 +615,13 @@ function botTrades(d) {
     { h: 'Einstieg', a: 'l', render: t => dtm(t.opened), sort: t => t.opened }, { h: 'Ausstieg', a: 'l', render: t => dtm(t.closed), sort: t => t.closed },
     { h: 'Dauer', render: t => days(t.hold_days), sort: t => t.hold_days }, { h: 'Einstiegskurs', render: t => price(t.entry) }, { h: 'Ausstiegskurs', render: t => price(t.exit) },
     { h: 'Ergebnis', render: t => signed(t.pnl), cls: t => tone(t.pnl), sort: t => t.pnl }, { h: '%', render: t => pct(t.pnl_pct), cls: t => tone(t.pnl_pct), sort: t => t.pnl_pct },
+    { h: 'Grund', a: 'l', render: t => `${d.reasons[t.entry_reason] || t.entry_reason || '–'} → ${d.reasons[t.exit_reason] || t.exit_reason || '–'}`, sort: t => t.exit_reason },
   ];
   return h('div', { class: 'stack' },
     h('div', { class: 'kpis' }, kpi('Trades', m.trades, null, '', M('trades')), kpi('Trefferquote', m.win_rate == null ? '–' : pct(m.win_rate, 0, false), null, '', M('win_rate')), kpi('Ø Gewinn', m.avg_win == null ? '–' : signed(m.avg_win), null, 'up'), kpi('Ø Verlust', m.avg_loss == null ? '–' : signed(m.avg_loss), null, 'down'),
       kpi('Bester Trade', m.best == null ? '–' : signed(m.best), null, tone(m.best)), kpi('Schlechtester', m.worst == null ? '–' : signed(m.worst), null, tone(m.worst))),
     h('div', { class: 'grid g2' }, card('Verteilung der Trade-Ergebnisse', histogram(trips.map(t => t.pnl_pct)), { tip: 'Wie viele Trades welches Ergebnis in Prozent hatten. Trendfolger haben typisch viele kleine Verluste links und wenige große Gewinne rechts.' }),
-      card('Alle Orders', table([{ h: 'Zeit', a: 'l', render: f => dtm(f.ts) }, { h: 'Coin', a: 'l', render: f => coin(f.symbol) }, { h: 'Seite', a: 'l', render: f => f.side === 'buy' ? 'Kauf' : 'Verkauf' }, { h: 'Menge', render: f => num(f.qty, 5) }, { h: 'Preis', render: f => price(f.price) }, { h: 'Gebühr', render: f => num(f.fee, 4) }], d.fills, { empty: 'Noch keine Orders.', maxH: 320 }), { flush: true })),
+      card('Alle Orders', table([{ h: 'Zeit', a: 'l', render: f => dtm(f.ts) }, { h: 'Coin', a: 'l', render: f => coin(f.symbol) }, { h: 'Seite', a: 'l', render: f => f.side === 'buy' ? 'Kauf' : 'Verkauf' }, { h: 'Grund', a: 'l', render: f => d.reasons[f.reason] || f.reason || '–' }, { h: 'Menge', render: f => num(f.qty, 5) }, { h: 'Preis', render: f => price(f.price) }, { h: 'Gebühr', render: f => num(f.fee, 4) }], d.fills, { empty: 'Noch keine Orders.', maxH: 320 }), { flush: true })),
     card('Abgeschlossene Trades', table(cols, trips, { empty: 'Noch keine abgeschlossenen Trades.', sortKey: 'Ausstieg' }), { flush: true }));
 }
 function fmtParam(v, unit) {

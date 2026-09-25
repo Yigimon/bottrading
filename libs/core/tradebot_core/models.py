@@ -31,6 +31,7 @@ class Order:
     bot: str = ""
     status: OrderStatus = OrderStatus.OPEN
     reject_reason: str = ""
+    reason: str = ""  # Signalgrund, z. B. breakout, stop_loss, channel_exit, force_exit
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class Fill:
     ts: int  # Millisekunden UTC
     bot: str = ""
     maker: bool = False
+    reason: str = ""
 
 
 @dataclass

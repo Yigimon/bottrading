@@ -95,6 +95,32 @@ services:
       retries: 3
       start_period: 60s
 
+  # Telegram-Bot: Befehle und Benachrichtigungen. Ohne TELEGRAM_TOKEN in der .env bleibt er inaktiv.
+  telegram:
+    build: ./services/telegram
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_AUTHORIZED: ${TELEGRAM_AUTHORIZED:-}
+      TELEGRAM_DAILY_REPORT: ${TELEGRAM_DAILY_REPORT:-21:00}
+      PYTHONPATH: /libs/core
+    volumes:
+      - ./libs/core:/libs/core:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis,time,sys; r=redis.Redis(host='redis'); v=r.get('heartbeat:telegram'); sys.exit(0 if v and time.time()-float(v)<60 else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
   # Dashboard: nur auf localhost gebunden, Zugriff per SSH-Tunnel (ssh -L 8080:localhost:8080 yigimon-vps)
   api:
     build: ./services/api

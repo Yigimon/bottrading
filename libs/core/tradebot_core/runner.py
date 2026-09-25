@@ -33,7 +33,7 @@ class BotRunner:
         qty = b.position_qty(sym)  # 2. Stop-Loss innerhalb der Kerze (bei Lücke zum Open)
         if qty > 0 and st.stop is not None and c.low <= st.stop:
             b.set_price(sym, min(st.stop, c.open))
-            b.place_order(sym, Side.SELL, qty, OrderType.MARKET, ts=c.close_time, bot=self.name)
+            b.place_order(sym, Side.SELL, qty, OrderType.MARKET, ts=c.close_time, bot=self.name, reason="stop_loss")
 
         b.on_candle(sym, c.high, c.low, c.close, c.close_time)  # 3. Kurs und Limit-Orders aktualisieren
 
@@ -60,6 +60,6 @@ class BotRunner:
                 notional = min(notional, D(str(st.vol_target)) * b.equity() / risk_per_unit * price)
             notional = min(notional, b.available_cash())
             qty = b.affordable_qty(sym, notional)
-            b.place_order(sym, Side.BUY, qty, OrderType.MARKET, ts=c.close_time, bot=self.name)
+            b.place_order(sym, Side.BUY, qty, OrderType.MARKET, ts=c.close_time, bot=self.name, reason=sig.reason)
         elif sig.action == "exit" and held > 0:
-            b.place_order(sym, Side.SELL, held, OrderType.MARKET, ts=c.close_time, bot=self.name)
+            b.place_order(sym, Side.SELL, held, OrderType.MARKET, ts=c.close_time, bot=self.name, reason=sig.reason)

@@ -3,9 +3,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 echo "== Unit-Tests"
-docker run --rm -v "$PWD":/app -w /app python:3.12-slim sh -c 'pip install -q pytest >/dev/null 2>&1; PYTHONPATH=libs/core pytest -q'
+docker run --rm -v "$PWD":/app -w /app python:3.12-slim sh -c 'pip install -q pytest httpx >/dev/null 2>&1; PYTHONPATH=libs/core pytest -q'
 echo "== Integrationstests"
 docker compose run --rm --no-deps -v ./tests/integration:/itest:ro bots python /itest/check_system.py
+echo "== Telegram (ohne echtes Telegram)"
+docker compose run --rm --no-deps -e TELEGRAM_CHAT_ID=4242 -v ./tests/integration:/itest:ro telegram python /itest/check_telegram.py
 echo "== API"
 fail=0
 for p in health prices wallets equity benchmark meta master system strategies analytics/backtests; do

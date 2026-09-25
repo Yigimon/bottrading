@@ -61,8 +61,8 @@ class PaperBroker(Broker):
         }
 
     # ---- Orders ----
-    def place_order(self, symbol, side, qty, type=OrderType.MARKET, limit_price=None, ts=0, bot="") -> Order:
-        order = Order(self._next_id, symbol, side, type, D(qty), None if limit_price is None else D(limit_price), bot)
+    def place_order(self, symbol, side, qty, type=OrderType.MARKET, limit_price=None, ts=0, bot="", reason="") -> Order:
+        order = Order(self._next_id, symbol, side, type, D(qty), None if limit_price is None else D(limit_price), bot, reason=reason)
         self._next_id += 1
         self.orders[order.id] = order
         rules = self.rules.get(symbol)
@@ -153,10 +153,10 @@ class PaperBroker(Broker):
 
     def _fill(self, order: Order, price: D, ts: int, maker: bool) -> Fill:
         order.status = OrderStatus.FILLED
-        return self._apply(order.id, order.symbol, order.side, order.qty, price, ts, order.bot, maker)
+        return self._apply(order.id, order.symbol, order.side, order.qty, price, ts, order.bot, maker, reason=order.reason)
 
     def _apply(self, order_id: int, symbol: str, side: Side, qty: D, price: D, ts: int, bot: str, maker: bool,
-               fee: D | None = None) -> Fill:
+               fee: D | None = None, reason: str = "") -> Fill:
         """Bucht einen Fill (Cash, Position, Einstandswert, realisierter PnL)."""
         notional = qty * price
         fee = notional * self.fee_rate if fee is None else fee
@@ -178,12 +178,12 @@ class PaperBroker(Broker):
                 self.positions.pop(symbol, None)
         self.fees_paid += fee
         self.realized_pnl += realized
-        fill = Fill(order_id, symbol, side, qty, price, fee, realized, ts, bot, maker)
+        fill = Fill(order_id, symbol, side, qty, price, fee, realized, ts, bot, maker, reason)
         self.fills.append(fill)
         return fill
 
     def restore(self, fills: list[Fill]) -> None:
         """Zustand aus gespeicherten Fills (in zeitlicher Reihenfolge) wiederherstellen, z. B. nach einem Neustart."""
         for f in fills:
-            self._apply(f.order_id, f.symbol, f.side, f.qty, f.price, f.ts, f.bot, f.maker, fee=f.fee)
+            self._apply(f.order_id, f.symbol, f.side, f.qty, f.price, f.ts, f.bot, f.maker, fee=f.fee, reason=f.reason)
         self._next_id = max([f.order_id for f in fills], default=0) + 1

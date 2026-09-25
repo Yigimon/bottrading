@@ -94,9 +94,9 @@ def restore_and_warm(db, w: Wallet, history: list[Candle]) -> list[Candle]:
     Gibt die danach geschlossenen Kerzen zurück; diese müssen regulär (mit Handel) nachgespielt werden."""
     cutoff = last_processed(db, w)
     with db.cursor() as cur:
-        cur.execute("SELECT order_id, symbol, side, qty, price, fee, realized_pnl, ts, bot, maker FROM fills "
+        cur.execute("SELECT order_id, symbol, side, qty, price, fee, realized_pnl, ts, bot, maker, reason FROM fills "
                     "WHERE account_id = %s ORDER BY ts, id", (w.account_id,))
-        fills = [Fill(o, s, Side(sd), D(q), D(p), D(f), D(r), t, b, m) for o, s, sd, q, p, f, r, t, b, m in cur.fetchall()]
+        fills = [Fill(o, s, Side(sd), D(q), D(p), D(f), D(r), t, b, m, rs) for o, s, sd, q, p, f, r, t, b, m, rs in cur.fetchall()]
     w.broker.restore(fills)
     w.persisted = len(w.broker.fills)
     entry_ts = {}  # Zeitpunkt des letzten Kaufs je Symbol, für den Strategiezustand
@@ -132,11 +132,11 @@ def save_state(db, w: Wallet, c: Candle) -> None:
 def persist(db, w: Wallet, ts: int) -> None:
     with db.cursor() as cur:
         for f in w.broker.fills[w.persisted:]:
-            cur.execute("INSERT INTO fills (account_id, bot, order_id, symbol, side, qty, price, fee, realized_pnl, maker, ts) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                        (w.account_id, f.bot, f.order_id, f.symbol, f.side.value, f.qty, f.price, f.fee, f.realized_pnl, f.maker, f.ts))
+            cur.execute("INSERT INTO fills (account_id, bot, order_id, symbol, side, qty, price, fee, realized_pnl, maker, ts, reason) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (w.account_id, f.bot, f.order_id, f.symbol, f.side.value, f.qty, f.price, f.fee, f.realized_pnl, f.maker, f.ts, f.reason))
             msg = f"{'KAUF' if f.side == Side.BUY else 'VERKAUF'} {f.qty} {f.symbol} @ {f.price} (Gebühr {f.fee:.4f}" + \
-                  (f", Ergebnis {f.realized_pnl:+.4f})" if f.side == Side.SELL else ")")
+                  (f", Ergebnis {f.realized_pnl:+.4f})" if f.side == Side.SELL else ")") + (f" [{f.reason}]" if f.reason else "")
             log.info("%s: %s", w.name, msg)
             cur.execute("INSERT INTO events (ts, level, source, wallet, message) VALUES (%s,'info','bots',%s,%s)", (now_ms(), w.name, msg))
         w.persisted = len(w.broker.fills)
@@ -146,21 +146,29 @@ def persist(db, w: Wallet, ts: int) -> None:
     # kein commit hier: Fills, Snapshot und bot_state werden vom Aufrufer gemeinsam bestätigt (kein doppeltes Buchen beim Nachspielen)
 
 
+def close_position(dbc, w: Wallet, sym: str, reason: str) -> bool:
+    """Position zum letzten 15-Minuten-Kurs schließen (Kill-Switch oder manueller Ausstieg)."""
+    if w.broker.position_qty(sym) <= 0:
+        return False
+    row = dbc.execute("SELECT close FROM candles WHERE symbol=%s AND interval='15m' ORDER BY open_time DESC LIMIT 1", (sym,)).fetchone()
+    if row:
+        w.broker.set_price(sym, D(str(row["close"])))
+    o = w.broker.place_order(sym, Side.SELL, w.broker.position_qty(sym), OrderType.MARKET, ts=now_ms(), bot=reason.replace("_", "-"), reason=reason)
+    return o.status.value == "filled"
+
+
 def liquidate(dbc, wallets: list[Wallet]) -> None:
     """Kill-Switch: alle offenen Positionen zum letzten 15-Minuten-Kurs schließen."""
     for w in wallets:
         for sym in list(w.broker.positions):
-            row = dbc.execute("SELECT close FROM candles WHERE symbol=%s AND interval='15m' ORDER BY open_time DESC LIMIT 1", (sym,)).fetchone()
-            if row:
-                w.broker.set_price(sym, D(str(row["close"])))
-            w.broker.place_order(sym, Side.SELL, w.broker.position_qty(sym), OrderType.MARKET, ts=now_ms(), bot="kill-switch")
+            close_position(dbc, w, sym, "kill_switch")
         persist(dbc, w, now_ms())
     add_event(dbc, "bots", "warn", "Kill-Switch: alle Positionen geschlossen")
     dbc.commit()
 
 
 async def control_loop(wallets: list[Wallet]) -> None:
-    """Liest alle 5 s die Steuerung: Pause je Wallet und globaler Kill-Switch."""
+    """Liest alle 5 s die Steuerung: Pause je Wallet, globaler Kill-Switch und manuelle Ausstiege."""
     dbc = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     killed = False
     while True:
@@ -177,6 +185,19 @@ async def control_loop(wallets: list[Wallet]) -> None:
             if kill and not killed:
                 liquidate(dbc, wallets)
             killed = kill
+            for key in [k for k in ctrl if k.startswith("forceexit:")]:  # manueller Ausstieg (Telegram/Dashboard)
+                _, wname, target = key.split(":", 2)
+                w = next((x for x in wallets if x.name == wname), None)
+                closed = []
+                if w:
+                    for sym in (list(w.broker.positions) if target == "all" else [target]):
+                        if close_position(dbc, w, sym, "force_exit"):
+                            closed.append(sym)
+                    persist(dbc, w, now_ms())
+                dbc.execute("DELETE FROM control WHERE key=%s", (key,))
+                add_event(dbc, "bots", "warn" if closed else "info",
+                          f"Manueller Ausstieg: {', '.join(closed)} geschlossen" if closed else f"Manueller Ausstieg: keine offene Position ({target})", wname)
+                dbc.commit()
         except Exception as e:  # Steuerung darf den Handel nie abstürzen lassen
             log.error("Steuerung: %s", e)
             dbc.rollback()

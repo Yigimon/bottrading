@@ -20,7 +20,7 @@ from psycopg.rows import dict_row
 
 from tradebot_core.metrics import daily_returns, max_drawdown, sharpe, trade_stats
 from tradebot_core.models import Side
-from tradebot_core.state import add_event, broker_for, latest_prices, now_ms
+from tradebot_core.state import REASONS, add_event, broker_for, latest_prices, now_ms, round_trips
 
 import lab
 from catalog import STRATEGY_CATALOG
@@ -161,7 +161,7 @@ def benchmark():
 
 @app.get("/api/fills")
 def fills(limit: int = 100, wallet: str | None = None):
-    q = ("SELECT a.name AS wallet, f.symbol, f.side, f.qty, f.price, f.fee, f.realized_pnl, f.ts, f.bot FROM fills f "
+    q = ("SELECT a.name AS wallet, f.symbol, f.side, f.qty, f.price, f.fee, f.realized_pnl, f.ts, f.bot, f.reason FROM fills f "
          "JOIN accounts a ON a.id = f.account_id " + ("WHERE a.name = %s " if wallet else "") + "ORDER BY f.ts DESC, f.id DESC LIMIT %s")
     with db() as conn:
         rows = conn.execute(q, ((wallet, min(limit, 500)) if wallet else (min(limit, 500),))).fetchall()
@@ -180,29 +180,6 @@ def events(limit: int = 100, wallet: str | None = None, level: str | None = None
                             + "ORDER BY id DESC LIMIT %s", (*args, min(limit, 500))).fetchall()
 
 
-def round_trips(fill_rows) -> list[dict]:
-    """Abgeschlossene Trades (Long, Durchschnittseinstand) aus der Fill-Folge."""
-    open_: dict[str, dict] = {}
-    out = []
-    for x in fill_rows:
-        o = open_.get(x["symbol"])
-        if x["side"] == "buy":
-            if not o:
-                o = open_[x["symbol"]] = {"symbol": x["symbol"], "opened": x["ts"], "qty": 0.0, "cost": 0.0, "fees": 0.0}
-            o["qty"] += float(x["qty"]); o["cost"] += float(x["qty"] * x["price"]); o["fees"] += float(x["fee"])
-        elif o:
-            o["fees"] += float(x["fee"])
-            out.append({"symbol": x["symbol"], "opened": o["opened"], "closed": x["ts"], "qty": float(x["qty"]),
-                        "entry": o["cost"] / o["qty"], "exit": float(x["price"]), "pnl": float(x["realized_pnl"]),
-                        "pnl_pct": float(x["price"]) / (o["cost"] / o["qty"]) - 1, "hold_days": (x["ts"] - o["opened"]) / 86_400_000,
-                        "bot": x["bot"]})
-            if float(x["qty"]) >= o["qty"] - 1e-12:
-                open_.pop(x["symbol"], None)
-            else:
-                o["cost"] *= 1 - float(x["qty"]) / o["qty"]; o["qty"] -= float(x["qty"])
-    return out
-
-
 @app.get("/api/wallet/{name}")
 def wallet_detail(name: str):
     with db() as conn:
@@ -217,7 +194,7 @@ def wallet_detail(name: str):
         for s in snaps:
             peak = max(peak, float(s["equity"]))
             dd_curve.append([s["ts"], -(peak - float(s["equity"])) / peak])
-        fill_rows = conn.execute("SELECT symbol, side, qty, price, fee, realized_pnl, ts, bot FROM fills WHERE account_id=%s ORDER BY ts, id", (a["id"],)).fetchall()
+        fill_rows = conn.execute("SELECT symbol, side, qty, price, fee, realized_pnl, ts, bot, reason FROM fills WHERE account_id=%s ORDER BY ts, id", (a["id"],)).fetchall()
         states = conn.execute("SELECT symbol, updated_ts, state FROM bot_state WHERE wallet=%s ORDER BY symbol", (name,)).fetchall()
         bt = conn.execute("SELECT kind, capital, params, metrics, created_at FROM backtest_runs WHERE strategy=%s AND interval=%s "
                           "AND kind IN ('run','walkforward') ORDER BY id DESC", (a["strategy"], a["interval"])).fetchall()
@@ -234,7 +211,7 @@ def wallet_detail(name: str):
                                                     "realized_pnl": float(r["realized_pnl"])} for r in fill_rows[::-1][:100]],
         "events": ev, "days_running": (now_ms() - m["since"]) / 86_400_000, "daily_return_count": len(daily),
         "monthly": lab.monthly([s["ts"] for s in snaps], [float(s["equity"]) for s in snaps], start) if snaps else [],
-        "param_docs": {"strategy": strategy_param_docs(a["strategy"]), "wallet": wallet_param_docs()},
+        "param_docs": {"strategy": strategy_param_docs(a["strategy"]), "wallet": wallet_param_docs()}, "reasons": REASONS,
         "backtest": None if not bt_run else {"return": bt_run["metrics"].get("return"), "max_dd": bt_run["metrics"].get("max_dd"),
                                               "sharpe": bt_run["metrics"].get("sharpe"), "trades": bt_run["metrics"].get("trades"),
                                               "win_rate": bt_run["metrics"].get("win_rate"), "profit_factor": bt_run["metrics"].get("profit_factor"),
@@ -301,7 +278,7 @@ def system():
         size = conn.execute("SELECT pg_database_size(current_database()) AS b").fetchone()["b"]
         tables = conn.execute("SELECT relname, n_live_tup AS rows FROM pg_stat_user_tables ORDER BY n_live_tup DESC LIMIT 12").fetchall()
     hb = {}
-    for svc in ("market-data", "bots", "master"):
+    for svc in ("market-data", "bots", "master", "telegram"):
         v = R.get(f"heartbeat:{svc}")
         hb[svc] = round(now - float(v), 1) if v else None
     return {"heartbeats": hb, "candles": [{**c, "age_s": round(now - c["last"] / 1000, 0)} for c in counts], "db_bytes": size,
