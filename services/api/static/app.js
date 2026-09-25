@@ -97,55 +97,138 @@ document.addEventListener('focusout', () => tip.classList.remove('show'));
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const alpha = (hex, a) => { const x = hex.replace('#', ''); const n = parseInt(x.length === 3 ? x.split('').map(c => c + c).join('') : x, 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; };
 const SERIES = () => [1, 2, 3, 4, 5, 6, 7, 8].map(i => css('--s' + i));
-let CHARTS = [];
-function disposeCharts() { CHARTS.forEach(c => { try { c.remove(); } catch (e) {} }); CHARTS = []; }
+let CHARTS = [], LINKS = {};
+function disposeCharts() { CHARTS.forEach(c => { try { c.remove(); } catch (e) {} }); CHARTS = []; LINKS = {}; }
 const toSec = (ms) => Math.floor(ms / 1000);
-function toSeries(points) { const m = new Map(); for (const [t, v] of points) if (v != null) m.set(toSec(t), v); return [...m].sort((a, b) => a[0] - b[0]).map(([time, value]) => ({ time, value })); }
+function toSeries(points, tf) { const m = new Map(); for (const [t, v] of points) if (v != null) m.set(toSec(t), tf ? tf(v) : v); return [...m].sort((a, b) => a[0] - b[0]).map(([time, value]) => ({ time, value })); }
+const fmtTime = (t) => new Date(t * 1000).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' });
 function baseChart(el, fmt) {
   const c = LightweightCharts.createChart(el, {
-    layout: { background: { type: 'solid', color: 'transparent' }, textColor: css('--ink-3'), fontFamily: css('--font'), fontSize: 11 },
-    grid: { vertLines: { color: css('--grid') }, horzLines: { color: css('--grid') } },
-    rightPriceScale: { borderVisible: false }, timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
-    crosshair: { mode: 0, vertLine: { color: css('--line-strong'), labelBackgroundColor: css('--surface-3') }, horzLine: { color: css('--line-strong'), labelBackgroundColor: css('--surface-3') } },
-    localization: { locale: 'de-DE', priceFormatter: fmt || ((v) => nf(1).format(v * 100) + ' %'), timeFormatter: (t) => new Date(t * 1000).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) },
-    autoSize: true, handleScroll: { mouseWheel: false, pressedMouseMove: true }, handleScale: { mouseWheel: true, pinch: true },
+    layout: { background: { type: 'solid', color: 'transparent' }, textColor: css('--ink-3'), fontFamily: css('--font'), fontSize: 11, attributionLogo: false },
+    grid: { vertLines: { visible: false }, horzLines: { color: css('--grid') } },
+    rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.1, bottom: 0.08 } }, timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false, rightOffset: 2 },
+    crosshair: { mode: 0, vertLine: { color: css('--line-strong'), width: 1, style: 3, labelBackgroundColor: css('--surface-3') }, horzLine: { color: css('--line-strong'), width: 1, style: 3, labelBackgroundColor: css('--surface-3') } },
+    localization: { locale: 'de-DE', priceFormatter: fmt || ((v) => nf(1).format(v * 100) + ' %'), timeFormatter: fmtTime },
+    autoSize: true, handleScroll: { mouseWheel: false, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false }, handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
   });
   CHARTS.push(c);
   return c;
 }
-/** Linienchart mit Legende (klickbar) und Crosshair-Tooltip. series: [{name, color, data, dashed, width}] */
+/** Tooltip am Mauszeiger, weicht an den Rändern aus. */
+function placeTip(xh, box, point) {
+  xh.style.display = 'block';
+  const w = xh.offsetWidth, hgt = xh.offsetHeight, W = box.clientWidth;
+  let x = point.x + 16; if (x + w > W - 60) x = point.x - w - 16; if (x < 4) x = 4;
+  let y = point.y - hgt / 2; y = Math.max(4, Math.min(y, box.clientHeight - hgt - 28));
+  xh.style.left = x + 'px'; xh.style.top = y + 'px';
+}
+function download(name, href) { const a = h('a', { href, download: name }); document.body.append(a); a.click(); a.remove(); }
+function chartPng(c, name) {
+  const src = c.takeScreenshot(), out = document.createElement('canvas');
+  out.width = src.width; out.height = src.height;
+  const g = out.getContext('2d'); g.fillStyle = css('--surface'); g.fillRect(0, 0, out.width, out.height); g.drawImage(src, 0, 0);
+  download(name + '.png', out.toDataURL('image/png'));
+}
+function seriesCsv(series, name, valueFmt = (v) => v) {
+  const times = [...new Set(series.flatMap(s => s.data.map(p => p[0])))].sort((a, b) => a - b);
+  const maps = series.map(s => new Map(s.data.map(p => [p[0], p[1]])));
+  const rows = [['Zeit', ...series.map(s => s.name)].join(';'), ...times.map(t => [new Date(t).toISOString(), ...maps.map(m => m.has(t) ? String(valueFmt(m.get(t))).replace('.', ',') : '')].join(';'))];
+  download(name + '.csv', URL.createObjectURL(new Blob(['﻿' + rows.join('\n')], { type: 'text/csv;charset=utf-8' })));
+}
+const RANGES = [['1M', 30], ['3M', 91], ['6M', 182], ['1J', 365], ['Alles', 0]];
+/** Werkzeugleiste: Zeitraum, Log-Skala, Vollbild, PNG, CSV. */
+function chartTools(o) {
+  const bar = h('div', { class: 'ctools' });
+  const spanDays = o.spanDays || 0;
+  if (o.range !== false && spanDays > 20) {
+    const rs = RANGES.filter(([, d]) => d === 0 || d < spanDays * 0.9);
+    const segEl = seg(rs.map(([l, d]) => [d, l]), 0, () => {});
+    segEl.querySelectorAll('button').forEach((b, i) => b.onclick = () => {
+      segEl.querySelectorAll('button').forEach(x => x.classList.remove('on')); b.classList.add('on');
+      const d = rs[i][1], c = o.chart(); if (!c) return;
+      if (!d) c.timeScale().fitContent(); else c.timeScale().setVisibleRange({ from: o.lastTime() - d * 86400, to: o.lastTime() + 3600 });
+    });
+    bar.append(segEl);
+  }
+  bar.append(h('span', { class: 'grow' }));
+  if (o.onLog) {
+    const btn = h('button', { class: 'btn sm ghost', type: 'button', 'data-tip': 'Logarithmische Skala: gleiche prozentuale Bewegungen sind gleich hoch. Hilfreich bei langen Zeiträumen mit starkem Wachstum.' }, 'Log');
+    btn.onclick = () => { btn.classList.toggle('on'); o.onLog(btn.classList.contains('on')); };
+    bar.append(btn);
+  }
+  bar.append(h('button', { class: 'btn sm ghost', type: 'button', 'data-tip': 'Zoom und Verschiebung zurücksetzen', onclick: () => o.chart()?.timeScale().fitContent() }, '⟲'));
+  if (o.csv) bar.append(h('button', { class: 'btn sm ghost', type: 'button', 'data-tip': 'Daten als CSV herunterladen (für Excel)', onclick: o.csv }, 'CSV'));
+  bar.append(h('button', { class: 'btn sm ghost', type: 'button', 'data-tip': 'Chart als Bild (PNG) herunterladen', onclick: () => chartPng(o.chart(), o.name || 'chart') }, 'PNG'));
+  bar.append(h('button', { class: 'btn sm ghost', type: 'button', 'data-tip': 'Vollbild (Esc beendet)', onclick: () => { const el = o.fullscreenEl(); document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.(); } }, '⛶'));
+  return bar;
+}
+/** Charts einer Gruppe teilen Zeitausschnitt und Fadenkreuz. */
+function link(group, entry) {
+  if (!group) return;
+  const list = (LINKS[group] ||= []); list.push(entry);
+  const lock = (list.lock ||= { range: false, xh: false });
+  entry.chart.timeScale().subscribeVisibleTimeRangeChange((r) => {
+    if (lock.range || !r) return; lock.range = true;
+    for (const o of list) if (o !== entry) { try { o.chart.timeScale().setVisibleRange(r); } catch (e) {} }
+    lock.range = false;
+  });
+  entry.chart.subscribeCrosshairMove((p) => {
+    if (lock.xh) return; lock.xh = true;
+    for (const o of list) if (o !== entry) {
+      try {
+        if (!p.time || !p.point) o.chart.clearCrosshairPosition();
+        else { const v = o.valueAt(p.time); if (v != null) o.chart.setCrosshairPosition(v, p.time, o.series); }
+      } catch (e) {}
+    }
+    lock.xh = false;
+  });
+}
+/** Linienchart mit Legende, Tooltip und Werkzeugleiste. series: [{name, color, data:[[ms, wert]], dashed, area, fill}] */
 function lineChart(series, opts = {}) {
-  const wrap = h('div'), legend = h('div', { class: 'legend' }), box = h('div', { class: 'chart ' + (opts.size || '') }), xh = h('div', { class: 'xhair' });
+  const wrap = h('div', { class: 'chartwrap' }), legend = h('div', { class: 'legend' }), box = h('div', { class: 'chart ' + (opts.size || '') }), xh = h('div', { class: 'xhair' });
   box.append(xh);
+  const fmt = opts.fmt || ((v) => pct(v, 1));
+  const points = series.reduce((n, s) => n + s.data.length, 0);
+  if (opts.emptyBelow && series.every(s => s.data.length < opts.emptyBelow)) { wrap.append(empty(opts.empty || 'Noch zu wenige Datenpunkte für einen Verlauf.')); return { node: wrap, after: () => {} }; }
+  const hidden = new Set(opts.hidden || []);
+  const allT = series.flatMap(s => s.data.map(p => p[0])), t0 = Math.min(...allT), t1 = Math.max(...allT);
+  let chart = null, refs = [], logMode = false, zero = null;
+  const tf = () => (logMode ? (v) => 1 + v : null);
+  const tools = opts.tools === false ? null : chartTools({ chart: () => chart, lastTime: () => toSec(t1), spanDays: points ? (t1 - t0) / 864e5 : 0, name: opts.name,
+    fullscreenEl: () => wrap, csv: () => seriesCsv(series, opts.name || 'daten', (v) => opts.csvFmt ? opts.csvFmt(v) : v),
+    onLog: opts.logable === false ? null : (on) => { logMode = on; chart.priceScale('right').applyOptions({ mode: on ? 1 : 0 }); chart.applyOptions({ localization: { priceFormatter: on ? (v) => nf(1).format((v - 1) * 100) + ' %' : (opts.axisFmt || ((v) => nf(1).format(v * 100) + ' %')) } }); series.forEach((s, i) => refs[i].setData(toSeries(s.data, tf()))); zero?.applyOptions({ price: on ? 1 : 0 }); } });
+  if (tools) wrap.append(tools);
   if (series.length > 1 || opts.legend) wrap.append(legend);
   wrap.append(box);
-  const fmt = opts.fmt || ((v) => pct(v, 1));
-  const hidden = new Set(opts.hidden || []);
   const after = () => {
-    const c = baseChart(box, opts.axisFmt);
-    const refs = series.map(s => {
+    const c = chart = baseChart(box, opts.axisFmt);
+    refs = series.map(s => {
       const l = s.area
-        ? c.addBaselineSeries({ baseValue: { type: 'price', price: 0 }, topLineColor: s.color, bottomLineColor: s.color, topFillColor1: 'transparent', topFillColor2: 'transparent', bottomFillColor1: s.fill || 'transparent', bottomFillColor2: s.fill || 'transparent', lineWidth: 2, priceLineVisible: false, lastValueVisible: false })
-        : c.addLineSeries({ color: s.color, lineWidth: s.width || 2, lineStyle: s.dashed ? 2 : 0, priceLineVisible: false, lastValueVisible: false, crosshairMarkerRadius: 4, crosshairMarkerBorderColor: css('--surface') });
+        ? c.addBaselineSeries({ baseValue: { type: 'price', price: 0 }, topLineColor: s.color, bottomLineColor: s.color, topFillColor1: 'transparent', topFillColor2: 'transparent', bottomFillColor1: s.fill || 'transparent', bottomFillColor2: s.fill || 'transparent', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerRadius: 4 })
+        : c.addLineSeries({ color: s.color, lineWidth: s.width || 2, lineStyle: s.dashed ? 2 : 0, priceLineVisible: false, lastValueVisible: !!opts.lastValue, crosshairMarkerRadius: 4, crosshairMarkerBorderColor: css('--surface') });
       l.setData(toSeries(s.data));
       if (hidden.has(s.name)) l.applyOptions({ visible: false });
       return l;
     });
+    if (opts.zeroLine !== false && !series.some(s => s.area)) zero = refs[0]?.createPriceLine({ price: 0, color: css('--line-strong'), lineWidth: 1, lineStyle: 0, axisLabelVisible: false });
     series.forEach((s, i) => {
       const last = s.data.length ? s.data[s.data.length - 1][1] : null;
-      const it = h('span', { class: 'it' + (hidden.has(s.name) ? ' off' : '') }, h('span', { class: 'sw', style: `background:${s.color};${s.dashed ? 'background:repeating-linear-gradient(90deg,' + s.color + ' 0 3px,transparent 3px 5px)' : ''}` }), s.name, h('b', null, fmt(last)));
-      it.onclick = () => { const off = !it.classList.toggle('off'); refs[i].applyOptions({ visible: off }); if (!off) hidden.add(s.name); else hidden.delete(s.name); opts.onToggle?.(s.name, !off); };
+      const it = h('span', { class: 'it' + (hidden.has(s.name) ? ' off' : ''), 'data-tip': 'Klick blendet die Linie ein oder aus' }, h('span', { class: 'sw' + (s.dashed ? ' dashed' : ''), style: `--c:${s.color}` }), s.name, h('b', null, fmt(last)));
+      it.onclick = () => { const vis = it.classList.toggle('off'); refs[i].applyOptions({ visible: !vis }); vis ? hidden.add(s.name) : hidden.delete(s.name); opts.onToggle?.(s.name, vis); };
       legend.append(it);
     });
     c.subscribeCrosshairMove((p) => {
       if (!p.time || !p.point || p.point.x < 0) { xh.style.display = 'none'; return; }
-      xh.replaceChildren(h('div', { class: 't' }, new Date(p.time * 1000).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })),
-        ...series.map((s, i) => { const d = p.seriesData.get(refs[i]); return d && refs[i].options().visible ? h('div', { class: 'r' }, h('span', null, h('span', { class: 'sw', style: 'background:' + s.color }), s.name), h('b', null, fmt(d.value))) : null; }));
-      xh.style.display = 'block';
+      const rows = series.map((s, i) => { const d = p.seriesData.get(refs[i]); return d && refs[i].options().visible ? h('div', { class: 'r' }, h('span', null, h('span', { class: 'sw' + (s.dashed ? ' dashed' : ''), style: `--c:${s.color}` }), s.name), h('b', null, fmt(logMode && !s.area ? d.value - 1 : d.value))) : null; }).filter(Boolean);
+      if (!rows.length) { xh.style.display = 'none'; return; }
+      xh.replaceChildren(h('div', { class: 't' }, fmtTime(p.time)), ...rows);
+      placeTip(xh, box, p.point);
     });
+    const map0 = new Map(toSeries(series[0].data).map(d => [d.time, d.value]));
+    link(opts.group, { chart: c, series: refs[0], valueAt: (t) => { const v = map0.get(t); return v == null ? null : logMode ? 1 + v : v; } });
     c.timeScale().fitContent();
   };
-  return { node: wrap, after };
+  return { node: wrap, after, chart: () => chart };
 }
 function sparkline(values, color) {
   const w = 200, hgt = 38;
@@ -203,9 +286,9 @@ const ICONS = {
 const PAGES = [
   { path: 'overview', label: 'Übersicht', render: overviewPage, live: true },
   { path: 'bots', label: 'Bots', render: botsPage, live: true },
-  { path: 'lab', label: 'Analyse-Labor', render: labPage, live: false },
+  { path: 'lab', short: 'Labor', label: 'Analyse-Labor', render: labPage, live: false },
   { path: 'strategies', label: 'Strategien', render: strategiesPage, live: false },
-  { path: 'system', label: 'Master & System', render: systemPage, live: true },
+  { path: 'system', short: 'System', label: 'Master & System', render: systemPage, live: true },
   { path: 'help', label: 'Glossar', render: helpPage, live: false },
 ];
 let META = null, ROUTE = null, lastHealth = null;
@@ -218,7 +301,7 @@ function go(path, q) { const qs = q ? '?' + new URLSearchParams(Object.entries(q
 function setQuery(q) { const r = parseHash(); const qs = new URLSearchParams({ ...r.q, ...q }); history.replaceState(null, '', '#/' + r.parts.map(encodeURIComponent).join('/') + '?' + qs); }
 
 function renderNav(active) {
-  $('#nav').replaceChildren(...PAGES.map(p => h('a', { href: '#/' + p.path, class: p.path === active ? 'on' : '' }, svgIcon(ICONS[p.path]), h('span', null, p.label))));
+  $('#nav').replaceChildren(...PAGES.map(p => h('a', { href: '#/' + p.path, class: p.path === active ? 'on' : '' }, svgIcon(ICONS[p.path]), h('span', { class: 'lbl' }, p.label), h('span', { class: 'lbl-s' }, p.short || p.label))));
 }
 function renderChrome(health, master) {
   lastHealth = health;
@@ -261,6 +344,7 @@ async function refresh(auto = false) {
 }
 window.addEventListener('hashchange', () => refresh());
 $('#refresh-btn').onclick = () => refresh();
+$('#theme-btn2').onclick = () => $('#theme-btn').click();
 $('#theme-btn').onclick = () => {
   const cur = document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
   const next = cur === 'dark' ? 'light' : 'dark';
@@ -290,7 +374,7 @@ async function overviewPage() {
     return h('div', { class: 'card' }, h('div', { class: 'bd' }, h('div', { class: 'row' }, h('b', null, coin(s)), h('span', { class: 'muted small' }, '/ USDT'), h('span', { class: 'grow' }), h('span', { class: 'small ' + tone(p?.change_24h) }, pct(p?.change_24h), ' 24 h')),
       h('div', { style: 'font-size:22px;font-weight:620;margin:2px 0 6px' }, price(p?.price)), sparkline(sp, css(p?.change_24h >= 0 ? '--candle-up' : '--candle-down')), h('div', { class: 'small muted', style: 'margin-top:4px' }, 'Letzte 72 Stunden')));
   }));
-  const chart = lineChart([...wallets.map(w => ({ name: w.name, color: colors[w.name], data: clip(eq[w.name] || []) })), { name: 'Buy & Hold', color: css('--bench'), dashed: true, data: clip(bench) }], { hidden: store.get('ov.hidden', []), onToggle: (n, off) => { const s = new Set(store.get('ov.hidden', [])); off ? s.add(n) : s.delete(n); store.set('ov.hidden', [...s]); } });
+  const chart = lineChart([...wallets.map(w => ({ name: w.name, color: colors[w.name], data: clip(eq[w.name] || []) })), { name: 'Buy & Hold', color: css('--bench'), dashed: true, data: clip(bench) }], { name: 'rendite-wallets', hidden: store.get('ov.hidden', []), onToggle: (n, off) => { const s = new Set(store.get('ov.hidden', [])); off ? s.add(n) : s.delete(n); store.set('ov.hidden', [...s]); } });
   const cols = [
     { h: 'Wallet', a: 'l', render: w => h('span', { class: 'row', style: 'gap:8px;flex-wrap:nowrap' }, h('span', { class: 'sw', style: 'background:' + colors[w.name] }), walletLink(w.name)), sort: w => w.name },
     { h: 'Strategie', a: 'l', render: w => `${STRAT[w.strategy] || w.strategy} · ${w.interval}`, sort: w => w.strategy + w.interval },
@@ -372,7 +456,7 @@ async function botsPage(r) {
     return h('section', { class: 'card' }, h('div', { class: 'botcard' },
       h('div', { class: 'h' }, h('span', { class: 'sw', style: 'background:' + colors[w.name] }), h('a', { href: '#/bots/' + encodeURIComponent(w.name) }, w.name), h('span', { class: 'grow' }), statusBadge(w)),
       h('div', { class: 'small muted' }, `${STRAT[w.strategy]} · ${IVL[w.interval]}-Kerzen · Start ${money(w.start_cash, 0)} USDT · nächste Kerze in ${ago((nextClose(w.interval, now) - now) / 1000)}`),
-      h('div', { class: 'kpis', style: 'grid-template-columns:repeat(4,1fr);gap:8px' }, kpi('Wert', money(w.equity), null, '', null, true), kpi('Rendite', pct(w.return, 2), null, tone(w.return), M('return'), true), kpi('Trades', w.trades, w.win_rate == null ? '' : pct(w.win_rate, 0, false) + ' Treffer', '', M('trades'), true), kpi('Investiert', pct(w.exposure, 0, false), null, '', null, true)),
+      h('div', { class: 'kpis mini' }, kpi('Wert', money(w.equity), null, '', null, true), kpi('Rendite', pct(w.return, 2), null, tone(w.return), M('return'), true), kpi('Trades', w.trades, w.win_rate == null ? '' : pct(w.win_rate, 0, false) + ' Treffer', '', M('trades'), true), kpi('Investiert', pct(w.exposure, 0, false), null, '', null, true)),
       h('div', { class: 'coins' }, d.states.map(s => {
         const sd = signalDistance(w.strategy, s.state);
         return h('div', { class: 'coin' }, h('span', { class: 'name' }, coin(s.symbol)),
@@ -406,8 +490,8 @@ async function botDetail(name, q) {
 async function botOverview(name, d) {
   const m = d.metrics, bt = d.backtest;
   const [eq, bench] = await Promise.all([api('equity'), api('benchmark')]);
-  const c1 = lineChart([{ name, color: SERIES()[0], data: eq[name] || [] }, { name: 'Buy & Hold', color: css('--bench'), dashed: true, data: bench }]);
-  const c2 = lineChart([{ name: 'Drawdown', color: css('--candle-down'), fill: alpha(css('--candle-down'), 0.18), area: true, data: d.drawdown_curve.length ? d.drawdown_curve : [[Date.now(), 0]] }], { size: 'sm' });
+  const c1 = lineChart([{ name, color: SERIES()[0], data: eq[name] || [] }, { name: 'Buy & Hold', color: css('--bench'), dashed: true, data: bench }], { name: name + '-wert', group: 'bot' });
+  const c2 = lineChart([{ name: 'Drawdown', color: css('--candle-down'), fill: alpha(css('--candle-down'), 0.18), area: true, data: d.drawdown_curve }], { size: 'sm', name: name + '-drawdown', group: 'bot', logable: false, emptyBelow: 2, empty: 'Noch kein Drawdown-Verlauf: Er entsteht mit den ersten abgeschlossenen Kerzen.' });
   const cmp = table([
     { h: 'Kennzahl', a: 'l', render: r => h('span', { class: 'row', style: 'gap:6px' }, r[0], info(r[3])) },
     { h: 'Live seit Start', render: r => r[1] }, { h: 'Backtest 4 Jahre', render: r => r[2] },
@@ -438,39 +522,60 @@ async function botChart(name, d, q) {
   const m = d.metrics, sym = q.coin || META.symbols[0], lim = +(q.n || 240);
   const cd = await api(`candles?symbol=${sym}&interval=${m.interval}&limit=${lim}&wallet=${encodeURIComponent(name)}`);
   const st = (d.states.find(s => s.symbol === sym) || {}).state || {};
-  const box = h('div', { class: 'chart lg' }), legend = h('div', { class: 'legend' }), xh = h('div', { class: 'xhair' });
+  const ind = st.indicators || {};
+  const wrap = h('div', { class: 'chartwrap' }), legend = h('div', { class: 'legend' }), box = h('div', { class: 'chart lg' }), xh = h('div', { class: 'xhair' });
   box.append(xh);
   const rsiBox = h('div', { class: 'chart xs' });
   const S = SERIES();
   const OV = m.strategy === 'trend'
     ? [['entry_level', 'Einstiegskanal (Hoch)', S[0], 0], ['exit_level', 'Ausstiegskanal (Tief)', S[1], 0], ['atr_stop', 'ATR-Stop-Niveau', S[2], 2], ['trend_ema', 'EMA-Trendfilter', S[3], 0]]
     : [['bb_upper', 'Bollinger oben', S[0], 2], ['bb_mid', 'Bollinger Mitte (Ziel)', S[0], 0], ['bb_lower', 'Bollinger unten (Kaufzone)', S[1], 0], ['trend_ema', 'EMA 200 (Trendfilter)', S[3], 0]];
+  let chart = null, cs = null, vol = null;
+  const k0 = cd.candles[0]?.time || 0, k1 = cd.candles.at(-1)?.time || 0;
+  const tools = chartTools({ chart: () => chart, lastTime: () => toSec(k1), spanDays: (k1 - k0) / 864e5, name: `${name}-${coin(sym)}`, fullscreenEl: () => wrap,
+    onLog: (on) => chart.priceScale('right').applyOptions({ mode: on ? 1 : 0 }),
+    csv: () => { const rows = ['Zeit;Eröffnung;Hoch;Tief;Schluss;Volumen', ...cd.candles.map(k => [new Date(k.time).toISOString(), k.open, k.high, k.low, k.close, k.volume].join(';').replace(/\./g, ','))];
+      download(`${name}-${coin(sym)}.csv`, URL.createObjectURL(new Blob(['﻿' + rows.join('\n')], { type: 'text/csv;charset=utf-8' }))); } });
+  const volBtn = h('button', { class: 'btn sm ghost on', type: 'button', 'data-tip': 'Handelsvolumen ein- oder ausblenden' }, 'Volumen');
+  volBtn.onclick = () => { volBtn.classList.toggle('on'); vol?.applyOptions({ visible: volBtn.classList.contains('on') }); };
+  tools.insertBefore(volBtn, tools.querySelector('.grow').nextSibling);
+  wrap.append(tools, legend, box);
   const after = () => {
-    const c = baseChart(box, (v) => price(v));
-    const cs = c.addCandlestickSeries({ upColor: css('--candle-up'), downColor: css('--candle-down'), borderVisible: false, wickUpColor: css('--candle-up'), wickDownColor: css('--candle-down'), priceLineVisible: true });
-    const bars = cd.candles.map(k => ({ time: toSec(k.time), open: k.open, high: k.high, low: k.low, close: k.close }));
-    cs.setData(bars);
+    const c = chart = baseChart(box, (v) => price(v));
+    c.applyOptions({ rightPriceScale: { scaleMargins: { top: 0.08, bottom: 0.22 } } });
+    cs = c.addCandlestickSeries({ upColor: css('--candle-up'), downColor: css('--candle-down'), borderVisible: false, wickUpColor: css('--candle-up'), wickDownColor: css('--candle-down'), priceLineVisible: true, priceLineStyle: 3 });
+    cs.setData(cd.candles.map(k => ({ time: toSec(k.time), open: k.open, high: k.high, low: k.low, close: k.close })));
+    vol = c.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, lastValueVisible: false, priceLineVisible: false });
+    c.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    vol.setData(cd.candles.map(k => ({ time: toSec(k.time), value: k.volume, color: alpha(k.close >= k.open ? css('--candle-up') : css('--candle-down'), 0.35) })));
     const lines = [];
     for (const [key, label, color, style] of OV) {
       const data = cd.overlays[key]; if (!data || !data.length) continue;
       const l = c.addLineSeries({ color, lineWidth: style ? 1 : 2, lineStyle: style, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-      l.setData(toSeries(data)); lines.push([label, color, l, style]);
-      const it = h('span', { class: 'it' }, h('span', { class: 'sw', style: 'background:' + color }), label);
-      it.onclick = () => { l.applyOptions({ visible: it.classList.contains('off') }); it.classList.toggle('off'); };
+      l.setData(toSeries(data)); lines.push([label, color, l]);
+      const it = h('span', { class: 'it', 'data-tip': 'Klick blendet die Linie ein oder aus' }, h('span', { class: 'sw' + (style ? ' dashed' : ''), style: `--c:${color}` }), label);
+      it.onclick = () => { const off = it.classList.toggle('off'); l.applyOptions({ visible: !off }); };
       legend.append(it);
     }
+    // Aktuelle Signal-Niveaus als beschriftete Linien
+    const lvl = (v, title, color) => v != null && cs.createPriceLine({ price: v, color, lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title });
+    if (m.strategy === 'trend') { if (st.in_position) { lvl(ind.stop, 'Stop', css('--candle-down')); lvl(ind.exit_level, 'Ausstieg unter', S[1]); } else lvl(ind.entry_level, 'Kauf über', S[0]); }
+    else { if (st.in_position) { lvl(ind.bb_mid, 'Ziel', S[0]); lvl(ind.stop, 'Stop', css('--candle-down')); } else lvl(ind.bb_lower, 'Kaufzone unter', S[1]); }
     const step = cd.candles.length > 1 ? cd.candles[1].time - cd.candles[0].time : 1;
-    const markers = cd.trades.map(t => { const bar = cd.candles.find(k => t.ts >= k.time && t.ts < k.time + step) || null; if (!bar) return null;
+    const markers = cd.trades.map(t => { const bar = cd.candles.find(k => t.ts >= k.time && t.ts < k.time + step); if (!bar) return null;
       return { time: toSec(bar.time), position: t.side === 'buy' ? 'belowBar' : 'aboveBar', color: t.side === 'buy' ? css('--accent') : css('--candle-down'), shape: t.side === 'buy' ? 'arrowUp' : 'arrowDown', text: t.side === 'buy' ? 'Kauf' : `Verkauf ${signed(t.pnl)}` }; }).filter(Boolean);
     cs.setMarkers(markers.sort((a, b) => a.time - b.time));
-    legend.append(h('span', { class: 'it' }, h('span', { class: 'sw', style: 'background:' + css('--accent') }), `Käufe/Verkäufe dieser Wallet (${cd.trades.length})`));
+    legend.append(h('span', { class: 'it' }, h('span', { class: 'sw', style: `--c:${css('--accent')}` }), `Käufe und Verkäufe dieser Wallet (${cd.trades.length})`));
     c.subscribeCrosshairMove((pp) => {
       if (!pp.time || !pp.point) { xh.style.display = 'none'; return; }
       const k = pp.seriesData.get(cs); if (!k) { xh.style.display = 'none'; return; }
-      xh.replaceChildren(h('div', { class: 't' }, new Date(pp.time * 1000).toLocaleString('de-DE')),
-        h('div', { class: 'r' }, h('span', null, 'Eröffnung / Schluss'), h('b', null, price(k.open) + ' / ' + price(k.close))), h('div', { class: 'r' }, h('span', null, 'Hoch / Tief'), h('b', null, price(k.high) + ' / ' + price(k.low))),
-        ...lines.map(([label, color, l]) => { const v = pp.seriesData.get(l); return v && l.options().visible ? h('div', { class: 'r' }, h('span', null, h('span', { class: 'sw', style: 'background:' + color }), label), h('b', null, price(v.value))) : null; }));
-      xh.style.display = 'block';
+      const v = pp.seriesData.get(vol), chg = k.close / k.open - 1;
+      xh.replaceChildren(h('div', { class: 't' }, fmtTime(pp.time)),
+        h('div', { class: 'r' }, h('span', null, 'Eröffnung'), h('b', null, price(k.open))), h('div', { class: 'r' }, h('span', null, 'Hoch'), h('b', null, price(k.high))),
+        h('div', { class: 'r' }, h('span', null, 'Tief'), h('b', null, price(k.low))), h('div', { class: 'r' }, h('span', null, 'Schluss'), h('b', { class: tone(chg) }, price(k.close) + ' (' + pct(chg, 2) + ')')),
+        v ? h('div', { class: 'r' }, h('span', null, 'Volumen'), h('b', null, nf(0).format(v.value))) : null,
+        ...lines.map(([label, color, l]) => { const x = pp.seriesData.get(l); return x && l.options().visible ? h('div', { class: 'r' }, h('span', null, h('span', { class: 'sw', style: `--c:${color}` }), label), h('b', null, price(x.value))) : null; }));
+      placeTip(xh, box, pp.point);
     });
     c.timeScale().fitContent();
     if (cd.overlays.rsi) {
@@ -478,26 +583,28 @@ async function botChart(name, d, q) {
       const rl = rc.addLineSeries({ color: S[6], lineWidth: 2, priceLineVisible: false, lastValueVisible: true });
       rl.setData(toSeries(cd.overlays.rsi));
       rl.createPriceLine({ price: (cd.params.rsi_entry ?? 30), color: css('--candle-down'), lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'Kaufschwelle' });
-      c.timeScale().subscribeVisibleLogicalRangeChange((rg) => { if (rg) rc.timeScale().setVisibleLogicalRange(rg); });
+      const rmap = new Map(toSeries(cd.overlays.rsi).map(x => [x.time, x.value])), cmap = new Map(cd.candles.map(k => [toSec(k.time), k.close]));
+      link('candle', { chart: c, series: cs, valueAt: (t) => cmap.get(t) ?? null });
+      link('candle', { chart: rc, series: rl, valueAt: (t) => rmap.get(t) ?? null });
     }
   };
-  const ind = st.indicators || {};
-  const indRows = Object.entries(ind).filter(([k]) => !(k === 'trend_ema' && m.strategy === 'trend' && !cd.params.trend_n)).map(([k, v]) => ({ k, v }));
   const sd = signalDistance(m.strategy, st);
   const rule = m.strategy === 'trend'
     ? (st.in_position ? `Position offen. Verkauf, wenn eine Kerze unter ${price(ind.exit_level)} schließt oder der Kurs den Stop bei ${price(ind.stop)} berührt.` : `Kein Bestand. Kauf, wenn eine ${m.interval}-Kerze über ${price(ind.entry_level)} schließt (aktuell ${price(st.close)}, es fehlen ${pct(ind.entry_level / st.close - 1, 1, false)}).`)
     : (st.in_position ? `Position offen. Verkauf bei Schluss über ${price(ind.bb_mid)}, am Stop ${price(ind.stop)} oder nach der maximalen Haltedauer.` : `Kein Bestand. Kauf, wenn RSI unter ${cd.params.rsi_entry ?? 30} (aktuell ${num(ind.rsi, 1)}), Schluss unter ${price(ind.bb_lower)} und über dem EMA ${price(ind.trend_ema)}.`);
+  const indRows = Object.entries(ind).filter(([k]) => !(k === 'trend_ema' && m.strategy === 'trend' && !cd.params.trend_n)).map(([k, v]) => ({ k, v }));
   const body = h('div', { class: 'stack' },
-    h('div', { class: 'row' }, seg(META.symbols.map(s => [s, coin(s)]), sym, v => go('bots/' + name, { tab: 'chart', coin: v, n: lim })), seg([[120, '120'], [240, '240'], [600, '600'], [1200, '1200']], lim, v => go('bots/' + name, { tab: 'chart', coin: sym, n: v })), h('span', { class: 'small muted' }, 'Kerzen · Mausrad zoomt, Ziehen verschiebt')),
-    card(`${coin(sym)} / USDT · ${IVL[m.interval]}`, h('div', null, legend, box, cd.overlays.rsi ? h('div', { style: 'margin-top:10px' }, h('div', { class: 'small muted', style: 'margin-bottom:4px' }, 'RSI (0 bis 100), gestrichelt: Kaufschwelle'), rsiBox) : null),
-      { tip: 'Kerzen mit den Linien, die die Strategie tatsächlich nutzt. Pfeile markieren Käufe und Verkäufe dieser Wallet. Klick auf einen Legenden-Eintrag blendet die Linie aus.' }),
+    h('div', { class: 'row' }, seg(META.symbols.map(s => [s, coin(s)]), sym, v => go('bots/' + name, { tab: 'chart', coin: v, n: lim })),
+      seg([[120, '120'], [240, '240'], [600, '600'], [1200, '1200']], lim, v => go('bots/' + name, { tab: 'chart', coin: sym, n: v })), h('span', { class: 'small muted hide-m' }, 'Kerzen geladen · Mausrad zoomt, Ziehen verschiebt, Doppelklick auf die Achse setzt zurück')),
+    card(`${coin(sym)} / USDT · ${IVL[m.interval]}`, h('div', null, wrap, cd.overlays.rsi ? h('div', { style: 'margin-top:12px' }, h('div', { class: 'small muted', style: 'margin-bottom:4px' }, 'RSI (0 bis 100), gestrichelt die Kaufschwelle. Zoom und Fadenkreuz laufen mit dem Kerzenchart mit.'), rsiBox) : null),
+      { tip: 'Kerzen mit den Linien, die die Strategie tatsächlich nutzt. Pfeile markieren Käufe und Verkäufe dieser Wallet, beschriftete Linien die aktuellen Signal-Niveaus. Klick auf einen Legenden-Eintrag blendet die Linie aus.' }),
     h('div', { class: 'grid g2' },
       card('Was muss passieren?', h('div', { class: 'prose' }, h('p', null, rule), h('p', { class: 'small muted' }, 'Stand nach der Kerze bis ', dtm(st.candle_close_time), '. Letztes Signal: ', st.last_signal ? `${st.last_signal.action === 'enter' ? 'Einstieg' : 'Ausstieg'} (${st.last_signal.reason}) am ${dtm(st.last_signal.time)}` : 'noch keines', '.'),
         sd.frac != null ? h('div', null, h('div', { class: 'small muted', style: 'margin-bottom:4px' }, 'Nähe zum Kaufsignal'), h('div', { class: 'meter' }, h('i', { style: `width:${sd.frac * 100}%` }))) : null)),
       card('Aktuelle Indikatorwerte', table([
-        { h: 'Indikator', a: 'l', render: r => h('span', { class: 'row', style: 'gap:6px' }, (META.indicators[r.k] || {}).label || r.k, info((META.indicators[r.k] || {}).what)) },
+        { h: 'Indikator', a: 'l', render: r => h('span', { class: 'row', style: 'gap:6px;flex-wrap:nowrap' }, (META.indicators[r.k] || {}).label || r.k, info((META.indicators[r.k] || {}).what)) },
         { h: 'Wert', render: r => r.v == null ? (r.k === 'stop' ? 'nur mit Position' : 'noch nicht bereit') : r.k === 'rsi' ? num(r.v, 1) : r.k === 'held_candles' ? r.v : price(r.v) },
-        { h: 'Abstand zum Kurs', render: r => (r.v == null || ['rsi', 'held_candles', 'atr'].includes(r.k)) ? '' : pct(r.v / st.close - 1) },
+        { h: 'Abstand', tip: 'Abstand des Niveaus zum aktuellen Kurs', render: r => (r.v == null || ['rsi', 'held_candles', 'atr'].includes(r.k)) ? '' : pct(r.v / st.close - 1) },
       ], indRows, { empty: 'Noch kein Zustand.' }), { flush: true })));
   return { body, after: [after] };
 }
@@ -602,7 +709,7 @@ function labBody(paint) {
   const actions = h('div', { class: 'row', style: 'margin-top:14px' },
     h('button', { class: 'btn primary', disabled: LAB.busy, onclick: () => runLab(paint) }, LAB.busy ? h('span', { class: 'spinner' }) : null, LAB.busy ? 'Rechnet …' : 'Backtest starten'),
     h('button', { class: 'btn', onclick: () => { LAB.req = labDefaults(R.strategy); paint(); } }, 'Standardwerte'));
-  const left = h('div', { class: 'card sticky' }, h('div', { class: 'bd' }, form, actions, h('div', { class: 'small muted', style: 'margin-top:10px' }, 'Ein blauer Punkt markiert Werte, die vom Standard abweichen. Das i-Symbol erklärt jeden Parameter.')));
+  const left = h('details', { class: 'card sticky labform', open: LAB.formOpen ?? window.innerWidth > 1100, ontoggle: (e) => { LAB.formOpen = e.target.open; } }, h('summary', null, 'Parameter anpassen', h('span', { class: 'small muted' }, `${STRAT[R.strategy]} · ${R.interval}`)), h('div', { class: 'bd' }, form, actions, h('div', { class: 'small muted', style: 'margin-top:10px' }, 'Ein blauer Punkt markiert Werte, die vom Standard abweichen. Das i-Symbol erklärt jeden Parameter.')));
   const tabs = [['result', 'Ergebnis'], ['sweep', 'Sensitivität'], ['compare', `Vergleich (${LAB.pinned.length})`], ['saved', 'Gespeicherte Tests']];
   const tabBar = h('div', { class: 'tabs' }, tabs.map(([k, l]) => h('button', { class: k === LAB.tab ? 'on' : '', onclick: () => { LAB.tab = k; paint(); } }, l)));
   const fns = [];
@@ -627,8 +734,8 @@ function labResult(fns, paint) {
   const res = LAB.result;
   if (!res) return h('div', { class: 'skeleton' }, h('div', { class: 'spinner', style: 'margin:0 auto 10px' }), 'Backtest läuft …');
   const m = res.metrics, rq = res.request, S = SERIES();
-  const c1 = lineChart([{ name: 'Strategie', color: S[0], data: res.curve }, { name: 'Buy & Hold', color: css('--bench'), dashed: true, data: res.bh_curve }], { size: 'lg' });
-  const c2 = lineChart([{ name: 'Drawdown', color: css('--candle-down'), area: true, fill: alpha(css('--candle-down'), 0.18), data: res.drawdown }], { size: 'sm' });
+  const c1 = lineChart([{ name: 'Strategie', color: S[0], data: res.curve }, { name: 'Buy & Hold', color: css('--bench'), dashed: true, data: res.bh_curve }], { size: 'lg', name: 'backtest-wert', group: 'lab' });
+  const c2 = lineChart([{ name: 'Drawdown', color: css('--candle-down'), area: true, fill: alpha(css('--candle-down'), 0.18), data: res.drawdown }], { size: 'sm', name: 'backtest-drawdown', group: 'lab', logable: false });
   fns.push(c1.after, c2.after);
   const changed = Object.entries(rq.params).filter(([k, v]) => META.defaults[rq.strategy][k] !== v);
   const per = Object.entries(m.per_symbol || {}).map(([s, x]) => ({ s, ...x }));
@@ -682,7 +789,7 @@ function labSweep(fns, paint) {
     const best = Math.max(...sw.rows.map(r => r.return));
     const bar = (v, mx, col) => h('div', { style: 'display:flex;align-items:center;gap:8px;justify-content:flex-end' }, h('span', null, pct(v)), h('div', { class: 'meter', style: 'width:90px' }, h('i', { style: `width:${Math.max(0, Math.min(1, Math.abs(v) / mx)) * 100}%;background:${col}` })));
     const mxR = Math.max(...sw.rows.map(r => Math.abs(r.return))) || 1, mxD = Math.max(...sw.rows.map(r => r.max_drawdown)) || 1;
-    const ch = lineChart([...sw.rows.map((r, i) => ({ name: `${sw.param} = ${r.value}`, color: S[i % 8], data: r.curve }))], { size: 'lg' });
+    const ch = lineChart([...sw.rows.map((r, i) => ({ name: `${sw.param} = ${r.value}`, color: S[i % 8], data: r.curve }))], { size: 'lg', name: 'sensitivitaet-' + sw.param });
     fns.push(ch.after);
     out.push(card(`Ergebnis je Wert von ${(META.params[`${R.strategy}.${sw.param}`] || {}).label || sw.param}`, table([
       { h: 'Wert', a: 'l', render: r => h('b', null, String(r.value)) },
@@ -699,7 +806,7 @@ function labCompare(fns, paint) {
   const P = LAB.pinned;
   if (!P.length) return card('Vergleich', empty('Noch nichts gemerkt. Starte einen Backtest und klicke auf „+ Zum Vergleich“. So kannst du bis zu 6 Varianten nebeneinanderlegen.'));
   const S = SERIES();
-  const ch = lineChart(P.map((p, i) => ({ name: p.label, color: S[i % 8], data: p.curve })), { size: 'lg' });
+  const ch = lineChart(P.map((p, i) => ({ name: p.label, color: S[i % 8], data: p.curve })), { size: 'lg', name: 'vergleich' });
   fns.push(ch.after);
   const metricsRows = [['Rendite', 'return', pct], ['Rendite p. a.', 'cagr', pct], ['Max. Drawdown', 'max_drawdown', v => pct(-v)], ['Sharpe', 'sharpe', num], ['Calmar', 'calmar', num], ['Trades', 'trades', v => v], ['Trefferquote', 'win_rate', v => pct(v, 0, false)], ['Profit-Faktor', 'profit_factor', num], ['Gebühren', 'fees', money], ['Buy & Hold', 'bh_return', pct]];
   const tbl = h('div', { class: 'tbl' }, h('table', null,
@@ -714,7 +821,7 @@ async function labSaved(el, fns) {
   const R = runs.filter(r => r.kind === 'run').sort((a, b) => (a.strategy + a.interval).localeCompare(b.strategy + b.interval) || b.capital - a.capital);
   const W = runs.filter(r => r.kind === 'walkforward');
   const S = SERIES(), big = R.filter(r => r.capital === 10000);
-  const ch = lineChart([...big.map((r, i) => ({ name: `${STRAT[r.strategy]} ${r.interval}`, color: S[i % 8], data: r.curve })), big[0] ? { name: 'Buy & Hold', color: css('--bench'), dashed: true, data: big[0].bh_curve } : null].filter(Boolean), { size: 'lg' });
+  const ch = lineChart([...big.map((r, i) => ({ name: `${STRAT[r.strategy]} ${r.interval}`, color: S[i % 8], data: r.curve })), big[0] ? { name: 'Buy & Hold', color: css('--bench'), dashed: true, data: big[0].bh_curve } : null].filter(Boolean), { size: 'lg', name: 'standard-backtests' });
   const node = h('div', { class: 'stack' },
     h('div', { class: 'banner note' }, 'Diese Tests sind die Referenz für die Live-Bots: Standardparameter, 4 Jahre, gleiche Kosten. Sie werden mit dem Backtest-Werkzeug erstellt und gespeichert.'),
     card('Standard-Backtests (10.000 USDT)', ch.node),
