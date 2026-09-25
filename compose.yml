@@ -1,0 +1,138 @@
+# Trading-Bot-Stack. Alle Ports nur auf localhost gebunden (Zugriff per SSH-Tunnel).
+name: tradebot
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  market-data:
+    build: ./services/market_data
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      SYMBOLS: ${SYMBOLS}
+      INTERVALS: ${INTERVALS}
+      BACKFILL_DAYS: ${BACKFILL_DAYS}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis,time,sys; r=redis.Redis(host='redis'); v=r.get('heartbeat:market-data'); sys.exit(0 if v and time.time()-float(v)<30 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
+  bots:
+    build: ./services/bots
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      SYMBOLS: ${SYMBOLS}
+      PYTHONPATH: /libs/core
+    volumes:
+      - ./libs/core:/libs/core:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      market-data:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis,time,sys; r=redis.Redis(host='redis'); v=r.get('heartbeat:bots'); sys.exit(0 if v and time.time()-float(v)<30 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  master:
+    build: ./services/master
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      SYMBOLS: ${SYMBOLS}
+      PYTHONPATH: /libs/core
+    volumes:
+      - ./libs/core:/libs/core:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis,time,sys; r=redis.Redis(host='redis'); v=r.get('heartbeat:master'); sys.exit(0 if v and time.time()-float(v)<90 else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # Dashboard: nur auf localhost gebunden, Zugriff per SSH-Tunnel (ssh -L 8080:localhost:8080 yigimon-vps)
+  api:
+    build: ./services/api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      SYMBOLS: ${SYMBOLS}
+      PYTHONPATH: /libs/core:/backtest
+    volumes:
+      - ./libs/core:/libs/core:ro
+      - ./services/backtest:/backtest:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=5)"]
+      interval: 20s
+      timeout: 8s
+      retries: 3
+
+  # Werkzeug-Container, läuft nur auf Abruf: docker compose run --rm backtest run --strategy trend
+  backtest:
+    build: ./services/backtest
+    profiles: ["tools"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      PYTHONPATH: /libs/core
+    volumes:
+      - ./libs/core:/libs/core:ro
+      - ./services/backtest:/app:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
