@@ -2,8 +2,9 @@
 
 Konfiguration (.env):
   TELEGRAM_TOKEN          Token von @BotFather
-  TELEGRAM_CHAT_ID        einzige Chat-ID, die Befehle senden darf und Meldungen bekommt
-  TELEGRAM_AUTHORIZED     optional: kommagetrennte User-IDs (für Gruppen)
+  TELEGRAM_CHAT_ID        einzige Chat-ID (Direktchat oder Gruppe), die Befehle senden darf und Meldungen bekommt
+  TELEGRAM_AUTHORIZED     kommagetrennte User-IDs, die steuern dürfen (in Gruppen dringend empfohlen)
+In einer Gruppe mit Themen legt der Bot die Themen selbst an (siehe topics.py) und verteilt die Meldungen.
   TELEGRAM_DAILY_REPORT   Uhrzeit des Tagesberichts, deutsche Zeit (Standard 21:00)
 Ohne TELEGRAM_CHAT_ID läuft der Bot im Einrichtungsmodus und nennt auf /start nur die Chat-ID.
 """
@@ -19,6 +20,7 @@ import redis
 from psycopg.rows import dict_row
 
 import commands as C
+import topics as T
 from fmt import LOCAL, coin, dur, esc, money, num, pct, price, signed, table, trend_icon
 from tg import TelegramAPI, TelegramError
 from tradebot_core.state import REASONS, broker_for, latest_prices, round_trips
@@ -98,9 +100,10 @@ def daily_report(conn) -> str:
              table(["Wallet", "Wert", "Gesamt", "24 h"], rows_), "",
              f"Trades in 24 h: {len(trips)}" + (f" · Ergebnis {signed(sum(t['pnl'] for t in trips))} USDT" if trips else ""),
              f"Offene Positionen: {open_pos}",
-             "Kurse 24 h: " + " · ".join(f"{coin(s)} {pct(p['change_24h'], 1)}" for s, p in prices.items())]
+             "", "<b>Je Coin</b>", C.coins_block(ctx)]
     text, _ = C.cmd_system(ctx, [], R)
     problems = [l for l in text.split("\n") if l.startswith("🔴")]
+    lines.append("")
     lines.append("System: " + ("alles in Ordnung" if not problems else "Störung – " + "; ".join(p[2:] for p in problems)))
     return "\n".join(lines)
 
@@ -134,16 +137,19 @@ class Bot:
         chat, user, text = m["chat"]["id"], (m.get("from") or {}).get("id"), m.get("text") or ""
         if not text.startswith("/"):
             return
+        thread = m.get("message_thread_id") if m.get("is_topic_message") else None
         if not CHAT_ID:
             if text.startswith("/start"):
-                self.api.send(chat, f"👋 Einrichtung: Deine Chat-ID ist <code>{chat}</code>.\nTrage sie in der .env als <code>TELEGRAM_CHAT_ID={chat}</code> ein und starte den Dienst neu.")
-            log.info("Einrichtungsmodus: Nachricht aus Chat %s", chat)
+                kind = m["chat"].get("type"); forum = m["chat"].get("is_forum")
+                self.api.send(chat, f"👋 Einrichtung\nChat-ID: <code>{chat}</code> ({esc(kind)}{', Themen aktiv' if forum else ''})\nDeine User-ID: <code>{user}</code>\n\n"
+                                    "Diese Werte werden in der .env eingetragen (TELEGRAM_CHAT_ID und TELEGRAM_AUTHORIZED). Bis dahin nimmt der Bot keine Befehle an.", thread_id=thread)
+            log.info("Einrichtungsmodus: /start aus Chat %s (%s, Themen: %s) von User %s", chat, m["chat"].get("type"), m["chat"].get("is_forum"), user)
             return
         if not self.authorized(chat, user):
             log.warning("Nicht autorisierter Zugriff: Chat %s, User %s", chat, user)
             return
         text_out, markup = self.run_command(text)
-        self.api.send(chat, text_out, markup)
+        self.api.send(chat, text_out, markup, thread_id=thread)
 
     def on_callback(self, q):
         msg, data, user = q.get("message") or {}, q.get("data") or "", (q.get("from") or {}).get("id")
@@ -184,9 +190,11 @@ class Bot:
                     except Exception as e:  # ein fehlerhafter Befehl darf den Bot nicht stoppen
                         log.exception("Befehl fehlgeschlagen")
                         self.conn.rollback()
-                        chat = (u.get("message") or (u.get("callback_query") or {}).get("message") or {}).get("chat", {}).get("id")
+                        m = u.get("message") or (u.get("callback_query") or {}).get("message") or {}
+                        chat = m.get("chat", {}).get("id")
                         if chat and str(chat) == CHAT_ID:
-                            self.api.send(chat, f"❌ Fehler bei der Ausführung: <code>{esc(type(e).__name__)}: {esc(str(e)[:300])}</code>")
+                            self.api.send(chat, f"❌ Fehler bei der Ausführung: <code>{esc(type(e).__name__)}: {esc(str(e)[:300])}</code>",
+                                          thread_id=m.get("message_thread_id") if m.get("is_topic_message") else None)
                 self.conn.rollback()  # keine offene Transaktion zwischen Abfragen halten
             except TelegramError as e:
                 log.warning("Polling: %s", e)
@@ -198,9 +206,11 @@ class Bot:
 
 # ------------------------------------------------------------------ Benachrichtigungen
 class Notifier:
-    def __init__(self, api: TelegramAPI):
+    def __init__(self, api: TelegramAPI, topics=None):
         self.api = api
         self.conn = connect()
+        self.topics = topics or T.Topics(api, self.conn, CHAT_ID)
+        self.topics.conn = self.conn  # ab jetzt nur noch vom Melder-Thread genutzt
         self.state = self.load_state()
 
     def load_state(self):
@@ -216,21 +226,23 @@ class Notifier:
         self.conn.execute("INSERT INTO control (key, value) VALUES ('telegram:state', %s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()", (json.dumps(self.state),))
         self.conn.commit()
 
-    def send(self, kind: str, text: str, settings: dict):
+    def send(self, kind: str, text: str, settings: dict, route: str | None = None):
+        """kind: Einstellung aus /notify (entry, exit, warning ...); route: Zuordnung zum Thema (Standard = kind)."""
         mode = settings.get(kind, "on")
         if mode == "off" or not CHAT_ID:
             return
-        self.api.send(CHAT_ID, text, silent=(mode == "silent"))
+        self.topics.send(route or kind, text, silent=(mode == "silent"))
 
     def tick(self):
         settings = C.notify_settings(self.conn)
-        fills = self.conn.execute("SELECT f.id, a.name AS wallet, f.symbol, f.side, f.qty, f.price, f.fee, f.realized_pnl, f.ts, f.reason FROM fills f "
+        fills = self.conn.execute("SELECT f.id, a.name AS wallet, a.start_cash, f.symbol, f.side, f.qty, f.price, f.fee, f.realized_pnl, f.ts, f.reason FROM fills f "
                                   "JOIN accounts a ON a.id=f.account_id WHERE f.id > %s ORDER BY f.id", (self.state["last_fill"],)).fetchall()
         for f in fills:
+            route = "trades_big" if float(f["start_cash"]) >= 1000 else "trades_small"
             if f["side"] == "buy":
-                self.send("entry", entry_message(self.conn, f), settings)
+                self.send("entry", entry_message(self.conn, f), settings, route)
             else:
-                self.send("exit", exit_message(self.conn, f), settings)
+                self.send("exit", exit_message(self.conn, f), settings, route)
             self.state["last_fill"] = f["id"]; self.save_state()
         events = self.conn.execute("SELECT id, ts, level, source, wallet, message FROM events WHERE id > %s ORDER BY id", (self.state["last_event"],)).fetchall()
         for e in events:
@@ -290,8 +302,14 @@ def main():
     log.info("Verbunden als @%s, %s", me.get("username"), "Chat-ID gesetzt" if CHAT_ID else "EINRICHTUNGSMODUS (keine Chat-ID)")
     api.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in C.MENU])
     if CHAT_ID:
-        threading.Thread(target=Notifier(api).run_forever, daemon=True).start()
-        api.send(CHAT_ID, "🤖 <b>Tradebot verbunden.</b> Befehle: /help", C.KEYBOARD, silent=C.notify_settings(connect()).get("startup") == "silent")
+        topics = T.Topics(api, connect(), CHAT_ID)
+        topics.setup()
+        log.info("Chat %s: %s", "Gruppe mit Themen" if topics.forum else "ohne Themen", topics.ids if topics.forum else "")
+        threading.Thread(target=Notifier(api, topics).run_forever, daemon=True).start()
+        topics.send("startup", "🤖 <b>Tradebot verbunden.</b> Befehle: /help" + ("\nMeldungen laufen in die Themen dieser Gruppe (/topics)." if topics.forum else ""),
+                    silent=C.notify_settings(connect()).get("startup") == "silent", markup=C.KEYBOARD)
+    if not AUTHORIZED and CHAT_ID.startswith("-"):
+        log.warning("Gruppe ohne TELEGRAM_AUTHORIZED: jedes Gruppenmitglied könnte steuern.")
     Bot(api).poll_forever()
 
 

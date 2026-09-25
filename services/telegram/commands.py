@@ -20,7 +20,7 @@ STRAT = {"trend": "Trend-Ausbruch", "meanrev": "Mean Reversion"}
 NOTIFY_TYPES = {"entry": "Käufe", "exit": "Verkäufe", "warning": "Warnungen (Pausen, Ausfälle)", "error": "Fehler", "info": "Info-Ereignisse",
                 "startup": "Start von Diensten", "daily": "Tagesbericht"}
 NOTIFY_DEFAULT = {"entry": "on", "exit": "on", "warning": "on", "error": "on", "info": "silent", "startup": "silent", "daily": "on"}
-KEYBOARD = {"keyboard": [["/status", "/wallets", "/profit"], ["/daily", "/trades", "/signals"], ["/pause", "/resume", "/help"]], "resize_keyboard": True, "is_persistent": True}
+KEYBOARD = {"keyboard": [["/status", "/wallets", "/profit"], ["/daily", "/trades", "/coins"], ["/pause", "/resume", "/help"]], "resize_keyboard": True, "is_persistent": True}
 
 HELP = """<b>Tradebot · Befehle</b>
 
@@ -28,6 +28,7 @@ HELP = """<b>Tradebot · Befehle</b>
 /status [wallet] – offene Positionen
 /wallets – alle Wallets mit Wert und Rendite
 /count – belegte Positions-Plätze je Wallet
+/coins – je Coin: Kurs, gehalten, Abstand zum Signal
 /signals – wie nah jeder Coin am Kaufsignal ist
 /prices – aktuelle Kurse
 
@@ -50,6 +51,7 @@ HELP = """<b>Tradebot · Befehle</b>
 /events [n] – letzte Ereignisse
 /config [wallet] – Parameter einer Wallet
 /notify [typ on|silent|off] – Benachrichtigungen
+/topics · /route – Themen der Gruppe und Zuordnung
 
 Wallet-Namen dürfen abgekürzt werden, z. B. <code>/profit trend4hL-1</code>."""
 
@@ -196,6 +198,70 @@ def cmd_signals(ctx, args):
     for (strategy, interval, _, parts), names in groups.items():
         lines.append(f"<b>{' / '.join(esc(n) for n in names)}</b>\n  {parts or 'noch kein Zustand'}")
     return "\n".join(lines), refresh("/signals")
+
+
+GROUP_LABEL = {("trend", "4h", ""): "Trend 4h", ("trend", "4h", "4hL"): "Trend 4h lang", ("trend", "1d", "1d"): "Trend 1d", ("meanrev", "4h", ""): "Mean Rev."}
+
+
+def strategy_groups(ctx):
+    """Eine repräsentative Wallet je Strategie-Variante (die mit dem größten Kapital)."""
+    groups = {}
+    for a in ctx.accounts():
+        key = (a["strategy"], a["interval"], json.dumps((a["params"] or {}).get("strategy_params"), sort_keys=True))
+        if key not in groups or float(a["start_cash"]) > float(groups[key]["start_cash"]):
+            groups[key] = a
+    out = []
+    for a in groups.values():
+        suffix = a["name"].split("-")[0][len(a["strategy"]):]
+        out.append((GROUP_LABEL.get((a["strategy"], a["interval"], suffix), f"{a['strategy']} {a['interval']}"), a))
+    return sorted(out, key=lambda x: x[0])
+
+
+def coins_block(ctx) -> str:
+    prices, lines = ctx.prices(), []
+    held = defaultdict(list)
+    for a in ctx.accounts():
+        for sym in ctx.broker(a).positions:
+            held[sym].append(a["name"])
+    groups = strategy_groups(ctx)
+    for sym in SYMBOLS:
+        p = prices.get(sym, {})
+        h = held.get(sym, [])
+        sig = " · ".join(f"{label} {signal_text(a['strategy'], ctx.states(a['name']).get(sym, {}))}" for label, a in groups)
+        lines.append(f"<b>{coin(sym)}</b> {price(p.get('price'))} ({pct(p.get('change_24h'), 1)})\n"
+                     f"  {'gehalten in ' + str(len(h)) + ' Wallet' + ('s' if len(h) != 1 else '') if h else 'nicht gehalten'}\n  {sig}")
+    return "\n".join(lines)
+
+
+def cmd_coins(ctx, args):
+    return ("🪙 <b>Je Coin</b>\nKurs (24 h) · gehalten · Abstand zum Kaufsignal je Strategie\n\n" + coins_block(ctx)), refresh("/coins")
+
+
+def cmd_topics(ctx, args):
+    import topics as T
+    r, silent = T.routing(ctx.conn), T.silent_topics(ctx.conn)
+    ids = {}
+    row = ctx.conn.execute("SELECT value FROM control WHERE key='telegram:topics'").fetchone()
+    if row:
+        ids = json.loads(row["value"])
+    lines = ["🗂 <b>Themen und Zuordnung</b>", ""]
+    for key, (name, _) in T.TOPICS.items():
+        lines.append(f"• <b>{esc(name)}</b> <code>{key}</code>{' 🔕 stumm' if key in silent else ''}{'' if key in ids else ' (noch nicht angelegt)'}")
+    lines += ["", "<b>Welche Meldung wohin</b>"] + [f"• {esc(T.ROUTE_LABELS[k])} → {esc(T.TOPICS.get(v, (v,))[0])}" for k, v in r.items()]
+    lines += ["", "Ändern: <code>/route warning overview</code>", "Stumm schalten: <code>/route silent trades_big on</code>"]
+    return "\n".join(lines), None
+
+
+def cmd_route(ctx, args):
+    import topics as T
+    if len(args) == 3 and args[0] == "silent" and args[1] in T.TOPICS and args[2] in ("on", "off"):
+        T.set_silent_topic(ctx.conn, args[1], args[2] == "on")
+        return cmd_topics(ctx, [])
+    if len(args) == 2 and args[0] in T.ROUTE_LABELS and args[1] in T.TOPICS:
+        T.set_route(ctx.conn, args[0], args[1])
+        return cmd_topics(ctx, [])
+    return ("Aufruf: <code>/route art thema</code> oder <code>/route silent thema on|off</code>\nArten: " + ", ".join(f"<code>{k}</code>" for k in T.ROUTE_LABELS)
+            + "\nThemen: " + ", ".join(f"<code>{k}</code>" for k in T.TOPICS)), None
 
 
 def cmd_prices(ctx, args):
@@ -513,10 +579,11 @@ COMMANDS = {
     "stats": cmd_stats, "trades": cmd_trades, "events": cmd_events, "logs": cmd_events, "config": cmd_config,
     "pause": lambda c, a: cmd_pause(c, a, True), "stopentry": lambda c, a: cmd_pause(c, a, True), "resume": lambda c, a: cmd_pause(c, a, False),
     "forceexit": cmd_forceexit, "fx": cmd_forceexit, "kill": cmd_kill, "unkill": cmd_unkill, "notify": cmd_notify,
+    "coins": cmd_coins, "topics": cmd_topics, "route": cmd_route,
 }
 MENU = [("status", "Offene Positionen"), ("wallets", "Wallets mit Wert und Rendite"), ("profit", "Gewinn und Kennzahlen"), ("daily", "Ergebnis je Tag"),
         ("weekly", "Ergebnis je Woche"), ("monthly", "Ergebnis je Monat"), ("trades", "Letzte Trades"), ("performance", "Ergebnis je Coin"),
-        ("stats", "Ergebnis je Ausstiegsgrund"), ("signals", "Abstand zum Kaufsignal"), ("count", "Belegte Plätze"), ("prices", "Kurse"),
+        ("stats", "Ergebnis je Ausstiegsgrund"), ("coins", "Überblick je Coin"), ("signals", "Abstand zum Kaufsignal"), ("count", "Belegte Plätze"), ("prices", "Kurse"),
         ("pause", "Wallet pausieren"), ("resume", "Wallet freigeben"), ("forceexit", "Position verkaufen"), ("kill", "Kill-Switch"),
         ("unkill", "Kill-Switch aufheben"), ("system", "Systemzustand"), ("events", "Letzte Ereignisse"), ("config", "Parameter einer Wallet"),
-        ("report", "Tagesbericht senden"), ("notify", "Benachrichtigungen"), ("help", "Hilfe")]
+        ("report", "Tagesbericht senden"), ("notify", "Benachrichtigungen"), ("topics", "Themen und Zuordnung"), ("route", "Zuordnung ändern"), ("help", "Hilfe")]
